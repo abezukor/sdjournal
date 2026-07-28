@@ -1,8 +1,17 @@
+## [0.1.22] - 2026-07-28
+
+### 🐛 Bug Fixes
+
+- Harden journal parsing, querying, and live tailing
 ## [0.1.21] - 2026-06-28
 
 ### 🐛 Bug Fixes
 
 - *(live)* [**breaking**] Make replay entry cap optional
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* 0.1.21
 ## [0.1.20] - 2026-06-27
 
 ### ⚡ Performance
