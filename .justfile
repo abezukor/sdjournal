@@ -12,6 +12,8 @@ ci:
     cargo clippy --all-targets --all-features -- -D warnings
     cargo clippy --all-targets --no-default-features -- -D warnings
     cargo nextest run --all-features
+    cargo test --doc --all-features
+    RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 
 bench:
     cargo bench --bench follow_perf

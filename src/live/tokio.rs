@@ -1,9 +1,12 @@
 use super::LiveSubscription;
 use crate::entry::LiveEntry;
 use crate::error::Result;
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
+use std::time::Duration;
 
 const DEFAULT_TOKIO_SUBSCRIPTION_BUFFER: usize = 1024;
+const TOKIO_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Tokio adapter for [`LiveSubscription`].
 ///
@@ -17,9 +20,18 @@ impl TokioSubscription {
     pub(crate) fn spawn(subscription: LiveSubscription) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_TOKIO_SUBSCRIPTION_BUFFER);
         thread::spawn(move || {
-            while let Ok(item) = subscription.recv() {
-                if tx.blocking_send(item).is_err() {
+            loop {
+                if tx.is_closed() {
                     break;
+                }
+                match subscription.recv_timeout(TOKIO_CANCELLATION_POLL_INTERVAL) {
+                    Ok(item) => {
+                        if tx.blocking_send(item).is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
         });

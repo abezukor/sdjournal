@@ -166,7 +166,7 @@ impl Journal {
 
         for idx in 0..self.inner.file_count() {
             let f = self.inner.open_file_by_index(idx)?;
-            crate::seal::verify_file_seal(&f, &params)?;
+            crate::seal::verify_file_seal(&f, &params, &key)?;
         }
         Ok(())
     }
@@ -211,7 +211,14 @@ impl JournalInner {
         if let Some(file) = &info.file {
             return Ok(file.clone());
         }
-        JournalFile::open(info.path.clone(), &self.config)
+        let file = JournalFile::open_reopen(info.path.clone(), &self.config)?;
+        if file.file_id() != info.file_id || file.seqnum_id() != info.seqnum_id {
+            return Err(SdJournalError::Transient {
+                path: Some(info.path.clone()),
+                reason: "journal file was replaced after discovery".to_string(),
+            });
+        }
+        Ok(file)
     }
 }
 
@@ -235,35 +242,25 @@ impl JournalFileInfo {
     }
 }
 
-pub(crate) fn journal_from_file_paths(
+pub(crate) fn journal_from_snapshot_files(
     roots: Vec<PathBuf>,
-    file_paths: Vec<PathBuf>,
+    files: &[JournalFile],
     config: JournalConfig,
 ) -> Result<Journal> {
     validate_journal_config(&config)?;
-    let file_set = open_journal_file_set(file_paths, &config)?;
+    let mut seen = HashSet::new();
+    let file_infos: Vec<JournalFileInfo> = files
+        .iter()
+        .filter(|file| seen.insert(file.file_id()))
+        .map(|file| JournalFileInfo::from_open_file(file.reopen_snapshot(), true))
+        .collect();
+    if file_infos.is_empty() {
+        return Err(SdJournalError::NotFound);
+    }
     Ok(Journal {
         inner: Arc::new(JournalInner {
             config,
             roots,
-            file_infos: file_set.file_infos,
-        }),
-    })
-}
-
-pub(crate) fn journal_from_open_files(
-    config: JournalConfig,
-    files: Vec<JournalFile>,
-) -> Result<Journal> {
-    validate_journal_config(&config)?;
-    let file_infos = files
-        .into_iter()
-        .map(|file| JournalFileInfo::from_open_file(file, true))
-        .collect();
-    Ok(Journal {
-        inner: Arc::new(JournalInner {
-            config,
-            roots: Vec::new(),
             file_infos,
         }),
     })

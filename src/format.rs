@@ -5,6 +5,7 @@ use std::path::Path;
 pub(crate) type FileOffset = u64;
 
 pub(crate) const HEADER_SIGNATURE: &[u8; 8] = b"LPKSHHRH";
+pub(crate) const HEADER_SIZE_MIN: u64 = 208;
 
 pub(crate) const HEADER_INCOMPATIBLE_COMPRESSED_XZ: u32 = 1 << 0;
 pub(crate) const HEADER_INCOMPATIBLE_COMPRESSED_LZ4: u32 = 1 << 1;
@@ -73,7 +74,7 @@ pub(crate) struct Header {
 
 impl Header {
     pub(crate) fn parse(buf: &[u8], path: &Path) -> Result<Self> {
-        if buf.len() < 184 {
+        if buf.len() < HEADER_SIZE_MIN as usize {
             return Err(SdJournalError::Corrupt {
                 path: Some(path.to_path_buf()),
                 offset: Some(0),
@@ -141,6 +142,13 @@ impl Header {
             offset: Some(88),
             reason: "missing header_size".to_string(),
         })?;
+        if header_size < HEADER_SIZE_MIN || !header_size.is_multiple_of(8) {
+            return Err(SdJournalError::Corrupt {
+                path: Some(path.to_path_buf()),
+                offset: Some(88),
+                reason: format!("invalid header_size: {header_size}"),
+            });
+        }
         let arena_size = read_u64_le(buf, 96).ok_or_else(|| SdJournalError::Corrupt {
             path: Some(path.to_path_buf()),
             offset: Some(96),
@@ -189,7 +197,9 @@ impl Header {
         let head_entry_seqnum = read_u64_le(buf, 168);
         let head_entry_realtime = read_u64_le(buf, 184);
         let tail_entry_realtime = read_u64_le(buf, 192);
-        let tail_entry_offset = read_u64_le(buf, 264);
+        let tail_entry_offset = (header_size >= 272)
+            .then(|| read_u64_le(buf, 264))
+            .flatten();
 
         Ok(Self {
             compatible_flags,
@@ -276,6 +286,14 @@ pub(crate) fn parse_entry_data_offsets_bytes(
     path: &Path,
     entry_offset: FileOffset,
 ) -> Result<Vec<FileOffset>> {
+    if items_bytes.is_empty() {
+        return Err(SdJournalError::Corrupt {
+            path: Some(path.to_path_buf()),
+            offset: Some(entry_offset),
+            reason: "ENTRY contains no items".to_string(),
+        });
+    }
+
     let mut data_offsets = Vec::new();
     if compact {
         // In compact format, each ENTRY item is 4 bytes:
@@ -302,7 +320,11 @@ pub(crate) fn parse_entry_data_offsets_bytes(
                 reason: "ENTRY compact item truncated".to_string(),
             })?;
             if off == 0 {
-                break;
+                return Err(SdJournalError::Corrupt {
+                    path: Some(path.to_path_buf()),
+                    offset: Some(entry_offset.saturating_add(64 + i as u64)),
+                    reason: "ENTRY item has zero object offset".to_string(),
+                });
             }
             data_offsets.push(u64::from(off));
             i += 4;
@@ -333,7 +355,11 @@ pub(crate) fn parse_entry_data_offsets_bytes(
                     reason: "ENTRY item truncated".to_string(),
                 })?;
             if object_offset == 0 {
-                break;
+                return Err(SdJournalError::Corrupt {
+                    path: Some(path.to_path_buf()),
+                    offset: Some(entry_offset.saturating_add(64 + i as u64)),
+                    reason: "ENTRY item has zero object offset".to_string(),
+                });
             }
             data_offsets.push(object_offset);
             i += 16;
@@ -381,7 +407,7 @@ mod tests {
     use std::path::Path;
 
     fn sample_header_bytes(compatible_flags: u32, incompatible_flags: u32) -> Vec<u8> {
-        let mut buf = vec![0u8; 184];
+        let mut buf = vec![0u8; HEADER_SIZE_MIN as usize];
         buf[0..8].copy_from_slice(HEADER_SIGNATURE);
         buf[8..12].copy_from_slice(&compatible_flags.to_le_bytes());
         buf[12..16].copy_from_slice(&incompatible_flags.to_le_bytes());
@@ -390,7 +416,7 @@ mod tests {
         buf[40..56].copy_from_slice(&[0x22; 16]);
         buf[56..72].copy_from_slice(&[0x33; 16]);
         buf[72..88].copy_from_slice(&[0x44; 16]);
-        buf[88..96].copy_from_slice(&184u64.to_le_bytes());
+        buf[88..96].copy_from_slice(&HEADER_SIZE_MIN.to_le_bytes());
         buf[96..104].copy_from_slice(&4096u64.to_le_bytes());
         buf[104..112].copy_from_slice(&256u64.to_le_bytes());
         buf[112..120].copy_from_slice(&64u64.to_le_bytes());
@@ -423,7 +449,7 @@ mod tests {
         assert_eq!(header.machine_id, [0x22; 16]);
         assert_eq!(header.boot_id, [0x33; 16]);
         assert_eq!(header.seqnum_id, [0x44; 16]);
-        assert_eq!(header.header_size, 184);
+        assert_eq!(header.header_size, HEADER_SIZE_MIN);
         assert_eq!(header.n_entries, 7);
         assert_eq!(header.entry_array_offset, 768);
         assert!(header.is_compact());
@@ -453,6 +479,46 @@ mod tests {
         assert_eq!(header.head_entry_realtime, Some(1_700_000_000_000_000));
         assert_eq!(header.tail_entry_realtime, Some(1_700_000_000_000_500));
         assert_eq!(header.tail_entry_offset, Some(4096));
+    }
+
+    #[test]
+    fn header_parse_ignores_extensions_past_declared_size() {
+        let mut buf = sample_header_bytes(0, 0);
+        buf.resize(272, 0xff);
+
+        let header = Header::parse(&buf, Path::new("dummy")).unwrap();
+
+        assert_eq!(header.header_size, HEADER_SIZE_MIN);
+        assert_eq!(header.head_entry_realtime, Some(0));
+        assert_eq!(header.tail_entry_realtime, Some(0));
+        assert_eq!(header.tail_entry_offset, None);
+    }
+
+    #[test]
+    fn header_parse_rejects_short_or_unaligned_declared_size() {
+        for invalid_size in [200u64, 209] {
+            let mut buf = sample_header_bytes(0, 0);
+            buf[88..96].copy_from_slice(&invalid_size.to_le_bytes());
+            match Header::parse(&buf, Path::new("dummy")) {
+                Err(SdJournalError::Corrupt { offset, reason, .. }) => {
+                    assert_eq!(offset, Some(88));
+                    assert_eq!(reason, format!("invalid header_size: {invalid_size}"));
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn header_parse_rejects_a_physically_truncated_minimum_header() {
+        let buf = vec![0u8; HEADER_SIZE_MIN as usize - 1];
+        match Header::parse(&buf, Path::new("dummy")) {
+            Err(SdJournalError::Corrupt { offset, reason, .. }) => {
+                assert_eq!(offset, Some(0));
+                assert_eq!(reason, "file too small for journal header");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]
@@ -514,7 +580,6 @@ mod tests {
 
         items.extend_from_slice(&100u32.to_le_bytes());
         items.extend_from_slice(&200u32.to_le_bytes());
-        items.extend_from_slice(&0u32.to_le_bytes());
 
         let got = parse_entry_data_offsets_bytes(&items, true, 1024, Path::new("dummy"), 0)
             .expect("parse compact entry items");
@@ -528,12 +593,35 @@ mod tests {
         items.extend_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
         items.extend_from_slice(&0u64.to_le_bytes());
 
-        items.extend_from_slice(&0u64.to_le_bytes());
+        items.extend_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
         items.extend_from_slice(&0xffff_eeee_dddd_ccccu64.to_le_bytes());
 
         let got = parse_entry_data_offsets_bytes(&items, false, 1024, Path::new("dummy"), 0)
             .expect("parse regular entry items");
-        assert_eq!(got, vec![0x1111_2222_3333_4444]);
+        assert_eq!(got, vec![0x1111_2222_3333_4444, 0x5555_6666_7777_8888]);
+    }
+
+    #[test]
+    fn entry_items_reject_zero_offsets() {
+        let compact = 0u32.to_le_bytes();
+        match parse_entry_data_offsets_bytes(&compact, true, 1024, Path::new("dummy"), 9) {
+            Err(SdJournalError::Corrupt { reason, offset, .. }) => {
+                assert_eq!(offset, Some(73));
+                assert_eq!(reason, "ENTRY item has zero object offset");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        let mut regular = Vec::new();
+        regular.extend_from_slice(&0u64.to_le_bytes());
+        regular.extend_from_slice(&123u64.to_le_bytes());
+        match parse_entry_data_offsets_bytes(&regular, false, 1024, Path::new("dummy"), 9) {
+            Err(SdJournalError::Corrupt { reason, offset, .. }) => {
+                assert_eq!(offset, Some(73));
+                assert_eq!(reason, "ENTRY item has zero object offset");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]

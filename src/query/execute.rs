@@ -1,10 +1,10 @@
-use super::cursor::build_cursor_key;
-use super::{JournalQuery, MatchTerm, build_branches, term_matches};
-use crate::cursor::Cursor;
+use super::cursor::{CursorStart, build_cursor_start, entry_key_from_meta};
+use super::{JournalQuery, MatchTerm, build_branches, entry_ref_matches_query};
+use crate::cursor::{compare_entry_keys, same_entry};
 use crate::entry::EntryRef;
 use crate::error::{Result, SdJournalError};
-use crate::file::{DataEntryOffsetIter, EntryMeta, FileEntryIter};
-use crate::journal::{JournalFileInfo, journal_from_open_files};
+use crate::file::{DataEntryOffsetIter, EntryMeta, FileEntryIter, JournalFile};
+use crate::journal::JournalFileInfo;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -42,7 +42,8 @@ struct FileOrIter {
     forward_heap: BinaryHeap<Reverse<FileOrHeapItem>>,
     reverse_heap: BinaryHeap<FileOrHeapItem>,
     iters: Vec<FileBranchIter>,
-    pending_errors: Vec<SdJournalError>,
+    pending_error: Option<SdJournalError>,
+    last_emitted: Option<EntryMeta>,
     done: bool,
 }
 
@@ -68,18 +69,22 @@ impl PartialOrd for FileOrHeapItem {
 
 impl Ord for FileOrHeapItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.meta.cmp_key(&other.meta)
+        self.meta
+            .seqnum
+            .cmp(&other.meta.seqnum)
+            .then_with(|| self.meta.entry_offset.cmp(&other.meta.entry_offset))
+            .then_with(|| self.branch_idx.cmp(&other.branch_idx))
     }
 }
 
 impl FileOrIter {
     fn new(mut iters: Vec<FileBranchIter>, reverse: bool) -> Self {
-        let mut pending_errors = Vec::new();
+        let mut pending_error = None;
         let mut forward_heap: BinaryHeap<Reverse<FileOrHeapItem>> = BinaryHeap::new();
         let mut reverse_heap: BinaryHeap<FileOrHeapItem> = BinaryHeap::new();
 
         for (idx, it) in iters.iter_mut().enumerate() {
-            if let Some(meta) = next_ok_meta(it, &mut pending_errors) {
+            if let Some(meta) = next_ok_meta(it, &mut pending_error) {
                 let item = FileOrHeapItem {
                     meta,
                     branch_idx: idx,
@@ -97,7 +102,8 @@ impl FileOrIter {
             forward_heap,
             reverse_heap,
             iters,
-            pending_errors,
+            pending_error,
+            last_emitted: None,
             done: false,
         }
     }
@@ -127,28 +133,38 @@ impl Iterator for FileOrIter {
             return None;
         }
 
-        if let Some(err) = self.pending_errors.pop() {
+        if let Some(err) = self.pending_error.take() {
             return Some(Err(err));
         }
 
-        let item = match self.pop_next() {
-            Some(item) => item,
-            None => {
-                self.done = true;
-                return None;
+        loop {
+            let item = match self.pop_next() {
+                Some(item) => item,
+                None => {
+                    self.done = true;
+                    return None;
+                }
+            };
+
+            if let Some(next_meta) =
+                next_ok_meta(&mut self.iters[item.branch_idx], &mut self.pending_error)
+            {
+                self.push_next(FileOrHeapItem {
+                    meta: next_meta,
+                    branch_idx: item.branch_idx,
+                });
             }
-        };
 
-        if let Some(next_meta) =
-            next_ok_meta(&mut self.iters[item.branch_idx], &mut self.pending_errors)
-        {
-            self.push_next(FileOrHeapItem {
-                meta: next_meta,
-                branch_idx: item.branch_idx,
-            });
+            if self
+                .last_emitted
+                .is_some_and(|last| same_meta_entry(&last, &item.meta))
+            {
+                continue;
+            }
+
+            self.last_emitted = Some(item.meta);
+            return Some(Ok(item.meta));
         }
-
-        Some(Ok(item.meta))
     }
 }
 
@@ -322,7 +338,7 @@ struct OffsetOrIter {
     forward_heap: BinaryHeap<Reverse<OffsetHeapItem>>,
     reverse_heap: BinaryHeap<OffsetHeapItem>,
     iters: Vec<DataEntryOffsetIter>,
-    pending_errors: Vec<SdJournalError>,
+    pending_error: Option<SdJournalError>,
     last_emitted: Option<u64>,
     done: bool,
 }
@@ -349,12 +365,12 @@ impl Ord for OffsetHeapItem {
 
 impl OffsetOrIter {
     fn new(mut iters: Vec<DataEntryOffsetIter>, reverse: bool) -> Self {
-        let mut pending_errors = Vec::new();
+        let mut pending_error = None;
         let mut forward_heap = BinaryHeap::new();
         let mut reverse_heap = BinaryHeap::new();
 
         for (idx, iter) in iters.iter_mut().enumerate() {
-            if let Some(offset) = next_ok_offset(iter, &mut pending_errors) {
+            if let Some(offset) = next_ok_offset(iter, &mut pending_error) {
                 let item = OffsetHeapItem {
                     offset,
                     iter_idx: idx,
@@ -372,7 +388,7 @@ impl OffsetOrIter {
             forward_heap,
             reverse_heap,
             iters,
-            pending_errors,
+            pending_error,
             last_emitted: None,
             done: false,
         }
@@ -403,7 +419,7 @@ impl Iterator for OffsetOrIter {
             return None;
         }
 
-        if let Some(err) = self.pending_errors.pop() {
+        if let Some(err) = self.pending_error.take() {
             return Some(Err(err));
         }
 
@@ -417,7 +433,7 @@ impl Iterator for OffsetOrIter {
             };
 
             if let Some(offset) =
-                next_ok_offset(&mut self.iters[item.iter_idx], &mut self.pending_errors)
+                next_ok_offset(&mut self.iters[item.iter_idx], &mut self.pending_error)
             {
                 self.push_next(OffsetHeapItem {
                     offset,
@@ -438,69 +454,80 @@ impl Iterator for OffsetOrIter {
 struct FileBranchIter {
     file: crate::file::JournalFile,
     kind: BranchKind,
+    exact_payloads: Vec<Vec<u8>>,
+    since_realtime: Option<u64>,
+    until_realtime: Option<u64>,
 }
 
 enum BranchKind {
     Empty,
-    Indexed {
-        offset_iter: AndOffsetIter,
-        present_fields: Vec<String>,
-    },
-    Scan {
-        iter: FileEntryIter,
-        terms: Vec<MatchTerm>,
-    },
+    Cursor(Option<EntryMeta>),
+    Indexed { offset_iter: AndOffsetIter },
+    Scan { iter: FileEntryIter },
 }
 
 impl FileBranchIter {
+    fn cursor(file: JournalFile, meta: EntryMeta) -> Self {
+        Self {
+            file,
+            kind: BranchKind::Cursor(Some(meta)),
+            exact_payloads: Vec::new(),
+            since_realtime: None,
+            until_realtime: None,
+        }
+    }
+
     fn new(
         file: crate::file::JournalFile,
         terms: Vec<MatchTerm>,
         reverse: bool,
         since_realtime: Option<u64>,
         until_realtime: Option<u64>,
+        after_entry_offset: Option<u64>,
     ) -> Result<Self> {
-        let mut present_fields = Vec::new();
-        let mut exact_terms = Vec::new();
+        let exact_payloads: Vec<Vec<u8>> = terms
+            .iter()
+            .filter_map(|term| match term {
+                MatchTerm::Exact { payload, .. } => Some(payload.clone()),
+                MatchTerm::Present { .. } => None,
+            })
+            .collect();
 
-        for t in &terms {
-            match t {
-                MatchTerm::Exact { .. } => exact_terms.push(t),
-                MatchTerm::Present { field } => present_fields.push(field.clone()),
-            }
-        }
-
-        if exact_terms.is_empty() {
-            let iter = file.entry_iter_seek_realtime(reverse, since_realtime, until_realtime)?;
+        if exact_payloads.is_empty() {
+            let iter = scan_iter(file.clone(), reverse, after_entry_offset)?;
             return Ok(Self {
                 file,
-                kind: BranchKind::Scan { iter, terms },
+                kind: BranchKind::Scan { iter },
+                exact_payloads,
+                since_realtime,
+                until_realtime,
             });
         }
 
         let mut data_refs = Vec::new();
-        for t in &exact_terms {
-            let payload = match t {
-                MatchTerm::Exact { payload, .. } => payload.as_slice(),
-                _ => continue,
-            };
-
+        for payload in &exact_payloads {
             match file.find_data_objects(payload) {
                 Ok(refs) if refs.is_empty() => {
                     return Ok(Self {
                         file,
                         kind: BranchKind::Empty,
+                        exact_payloads,
+                        since_realtime,
+                        until_realtime,
                     });
                 }
                 Ok(refs) => data_refs.push(refs),
-                Err(_) => {
-                    let iter =
-                        file.entry_iter_seek_realtime(reverse, since_realtime, until_realtime)?;
+                Err(SdJournalError::Corrupt { .. } | SdJournalError::Transient { .. }) => {
+                    let iter = scan_iter(file.clone(), reverse, after_entry_offset)?;
                     return Ok(Self {
                         file,
-                        kind: BranchKind::Scan { iter, terms },
+                        kind: BranchKind::Scan { iter },
+                        exact_payloads,
+                        since_realtime,
+                        until_realtime,
                     });
                 }
+                Err(error) => return Err(error),
             }
         }
 
@@ -513,16 +540,23 @@ impl FileBranchIter {
         for refs in data_refs {
             let mut term_iters = Vec::with_capacity(refs.len());
             for data_ref in refs {
-                match file.data_entry_offsets(data_ref, reverse) {
+                let result = match after_entry_offset {
+                    Some(offset) => file.data_entry_offsets_after_offset(data_ref, reverse, offset),
+                    None => file.data_entry_offsets(data_ref, reverse),
+                };
+                match result {
                     Ok(iter) => term_iters.push(iter),
-                    Err(_) => {
-                        let iter =
-                            file.entry_iter_seek_realtime(reverse, since_realtime, until_realtime)?;
+                    Err(SdJournalError::Corrupt { .. } | SdJournalError::Transient { .. }) => {
+                        let iter = scan_iter(file.clone(), reverse, after_entry_offset)?;
                         return Ok(Self {
                             file,
-                            kind: BranchKind::Scan { iter, terms },
+                            kind: BranchKind::Scan { iter },
+                            exact_payloads,
+                            since_realtime,
+                            until_realtime,
                         });
                     }
+                    Err(error) => return Err(error),
                 }
             }
             match term_iters.len() {
@@ -530,11 +564,23 @@ impl FileBranchIter {
                     return Ok(Self {
                         file,
                         kind: BranchKind::Empty,
+                        exact_payloads,
+                        since_realtime,
+                        until_realtime,
                     });
                 }
-                1 => iters.push(OffsetIter::Single(
-                    term_iters.pop().expect("single term iterator is available"),
-                )),
+                1 => {
+                    let Some(iter) = term_iters.pop() else {
+                        return Ok(Self {
+                            file,
+                            kind: BranchKind::Empty,
+                            exact_payloads,
+                            since_realtime,
+                            until_realtime,
+                        });
+                    };
+                    iters.push(OffsetIter::Single(iter));
+                }
                 _ => iters.push(OffsetIter::Or(OffsetOrIter::new(term_iters, reverse))),
             }
         }
@@ -543,8 +589,10 @@ impl FileBranchIter {
             file,
             kind: BranchKind::Indexed {
                 offset_iter: AndOffsetIter::new(iters, reverse),
-                present_fields,
             },
+            exact_payloads,
+            since_realtime,
+            until_realtime,
         })
     }
 }
@@ -553,13 +601,13 @@ impl Iterator for FileBranchIter {
     type Item = Result<EntryMeta>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let since_realtime = self.since_realtime;
+        let until_realtime = self.until_realtime;
         loop {
             match &mut self.kind {
                 BranchKind::Empty => return None,
-                BranchKind::Indexed {
-                    offset_iter,
-                    present_fields,
-                } => {
+                BranchKind::Cursor(meta) => return meta.take().map(Ok),
+                BranchKind::Indexed { offset_iter } => {
                     let entry_offset = match offset_iter.next()? {
                         Ok(v) => v,
                         Err(e) => {
@@ -573,37 +621,34 @@ impl Iterator for FileBranchIter {
                         Err(e) => return Some(Err(e)),
                     };
 
-                    if present_fields.is_empty() {
-                        return Some(Ok(meta));
-                    }
-
-                    let owned = match self.file.read_entry_owned(entry_offset) {
-                        Ok(e) => e,
-                        Err(e) => return Some(Err(e)),
+                    let entry = match self.file.read_entry_ref(entry_offset) {
+                        Ok(entry) => entry,
+                        Err(error) => return Some(Err(error)),
                     };
-
-                    if present_fields.iter().all(|f| owned.get(f).is_some()) {
-                        return Some(Ok(meta));
+                    if !self
+                        .exact_payloads
+                        .iter()
+                        .all(|payload| entry_contains_payload(&entry, payload))
+                    {
+                        self.kind = BranchKind::Empty;
+                        return Some(Err(self.file.metadata_error(
+                            Some(entry_offset),
+                            "DATA index references an ENTRY that does not contain the indexed field",
+                        )));
                     }
 
-                    continue;
-                }
-                BranchKind::Scan { iter, terms } => match iter.next()? {
-                    Ok(meta) => {
-                        if terms.is_empty() {
-                            return Some(Ok(meta));
-                        }
-
-                        let owned = match self.file.read_entry_owned(meta.entry_offset) {
-                            Ok(e) => e,
-                            Err(e) => return Some(Err(e)),
-                        };
-
-                        if terms.iter().all(|t| term_matches(&owned, t)) {
-                            return Some(Ok(meta));
-                        }
-
+                    if !time_matches(&meta, since_realtime, until_realtime) {
                         continue;
+                    }
+
+                    return Some(Ok(meta));
+                }
+                BranchKind::Scan { iter } => match iter.next()? {
+                    Ok(meta) => {
+                        if !time_matches(&meta, since_realtime, until_realtime) {
+                            continue;
+                        }
+                        return Some(Ok(meta));
                     }
                     Err(e) => return Some(Err(e)),
                 },
@@ -612,18 +657,27 @@ impl Iterator for FileBranchIter {
     }
 }
 
-pub(super) enum JournalIter {
-    Eager(EagerJournalIter),
-    Lazy(LazyJournalIter),
+fn scan_iter(
+    file: crate::file::JournalFile,
+    reverse: bool,
+    after_entry_offset: Option<u64>,
+) -> Result<FileEntryIter> {
+    match after_entry_offset {
+        Some(offset) => file.entry_iter_after_offset(reverse, offset, None, None),
+        None => file.entry_iter_seek_realtime(reverse, None, None),
+    }
 }
+
+fn time_matches(meta: &EntryMeta, since: Option<u64>, until: Option<u64>) -> bool {
+    since.is_none_or(|value| meta.realtime_usec >= value)
+        && until.is_none_or(|value| meta.realtime_usec <= value)
+}
+
+pub(super) struct JournalIter(EagerJournalIter);
 
 impl JournalIter {
     pub(super) fn new(query: JournalQuery) -> Result<Self> {
-        if query.journal.inner.is_lazy() {
-            LazyJournalIter::new(query).map(JournalIter::Lazy)
-        } else {
-            EagerJournalIter::new(query).map(JournalIter::Eager)
-        }
+        EagerJournalIter::new(query).map(Self)
     }
 }
 
@@ -631,22 +685,20 @@ impl Iterator for JournalIter {
     type Item = Result<EntryRef>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            JournalIter::Eager(iter) => iter.next(),
-            JournalIter::Lazy(iter) => iter.next(),
-        }
+        self.0.next()
     }
 }
 
 pub(super) struct EagerJournalIter {
     query: JournalQuery,
-    cursor_key: Option<(EntryMeta, bool)>, // (cursor meta, inclusive)
+    cursor_start: Option<CursorStart>,
+    cursor_reached: bool,
     produced: usize,
     last_emitted: Option<EntryMeta>,
-    forward_heap: BinaryHeap<Reverse<HeapItem>>,
-    reverse_heap: BinaryHeap<HeapItem>,
+    candidates: Vec<Option<HeapItem>>,
     iters: Vec<FileMetaIter>,
-    pending_errors: Vec<SdJournalError>,
+    files: Vec<JournalFile>,
+    pending_error: Option<SdJournalError>,
     done: bool,
 }
 
@@ -654,82 +706,25 @@ pub(super) struct EagerJournalIter {
 struct HeapItem {
     meta: EntryMeta,
     iter_idx: usize,
-    file_idx: usize,
 }
 
-impl PartialEq for HeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.meta == other.meta
-            && self.iter_idx == other.iter_idx
-            && self.file_idx == other.file_idx
-    }
-}
-
-impl Eq for HeapItem {}
-
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.meta
-            .cmp_key(&other.meta)
-            .then_with(|| self.file_idx.cmp(&other.file_idx))
-    }
-}
-
-fn matching_file_indexes(
-    query: &JournalQuery,
-    cursor_key: Option<(EntryMeta, bool)>,
-) -> Vec<usize> {
+fn matching_file_indexes(query: &JournalQuery) -> Vec<usize> {
     (0..query.journal.inner.file_count())
         .filter(|idx| {
             let Some(info) = query.journal.inner.file_info(*idx) else {
                 return false;
             };
-            info_may_match_query(query, cursor_key, info)
+            info_may_match_query(info)
         })
         .collect()
 }
 
-fn info_may_match_query(
-    query: &JournalQuery,
-    cursor_key: Option<(EntryMeta, bool)>,
-    info: &JournalFileInfo,
-) -> bool {
+fn info_may_match_query(info: &JournalFileInfo) -> bool {
     if !info.entry_range_known {
         return true;
     }
 
-    let Some(range) = info.entry_range else {
-        return false;
-    };
-
-    if let Some(since) = query.since_realtime
-        && range.last.realtime_usec < since
-    {
-        return false;
-    }
-    if let Some(until) = query.until_realtime
-        && range.first.realtime_usec > until
-    {
-        return false;
-    }
-    if let Some((cursor, inclusive)) = cursor_key {
-        let ord = range.last.cmp_key(&cursor);
-        if inclusive {
-            if ord == std::cmp::Ordering::Less {
-                return false;
-            }
-        } else if ord != std::cmp::Ordering::Greater {
-            return false;
-        }
-    }
-
-    true
+    info.entry_range.is_some()
 }
 
 impl EagerJournalIter {
@@ -737,29 +732,33 @@ impl EagerJournalIter {
         if matches!(query.limit, Some(0)) {
             return Ok(Self {
                 query,
-                cursor_key: None,
+                cursor_start: None,
+                cursor_reached: true,
                 produced: 0,
                 last_emitted: None,
-                forward_heap: BinaryHeap::new(),
-                reverse_heap: BinaryHeap::new(),
+                candidates: Vec::new(),
                 iters: Vec::new(),
-                pending_errors: Vec::new(),
+                files: Vec::new(),
+                pending_error: None,
                 done: true,
             });
         }
 
-        let mut pending_errors = Vec::new();
-        let cursor_key = build_cursor_key(&query)?;
+        let mut pending_error = None;
+        let cursor_start = build_cursor_start(&query)?;
+        let cursor_reached = cursor_start
+            .as_ref()
+            .is_none_or(|cursor| cursor.exact_meta().is_none());
         let branches = build_branches(&query);
-        let file_indexes = matching_file_indexes(&query, cursor_key);
+        let file_indexes = matching_file_indexes(&query);
 
         let mut iters = Vec::with_capacity(file_indexes.len());
-        let mut iter_file_indexes = Vec::with_capacity(file_indexes.len());
+        let mut files = Vec::with_capacity(file_indexes.len());
         for file_idx in file_indexes.iter().copied() {
             let file = match query.journal.inner.open_file_by_index(file_idx) {
                 Ok(file) => file,
                 Err(e) => {
-                    pending_errors.push(e);
+                    pending_error.get_or_insert(e);
                     continue;
                 }
             };
@@ -771,74 +770,79 @@ impl EagerJournalIter {
                     query.reverse,
                     query.since_realtime,
                     query.until_realtime,
+                    None,
                 ) {
                     Ok(it) => branch_iters.push(it),
-                    Err(e) => pending_errors.push(e),
+                    Err(e) => {
+                        pending_error.get_or_insert(e);
+                    }
                 }
             }
+            if let Some(cursor_meta) = cursor_start
+                .as_ref()
+                .and_then(CursorStart::exact_meta)
+                .filter(|meta| meta.file_id == file.file_id())
+            {
+                branch_iters.push(FileBranchIter::cursor(file.clone(), cursor_meta));
+            }
             iters.push(FileMetaIter::from_branch_iters(branch_iters, query.reverse));
-            iter_file_indexes.push(file_idx);
+            files.push(file);
         }
 
-        let mut forward_heap: BinaryHeap<Reverse<HeapItem>> = BinaryHeap::new();
-        let mut reverse_heap: BinaryHeap<HeapItem> = BinaryHeap::new();
+        let mut candidates = vec![None; iters.len()];
 
         for (idx, it) in iters.iter_mut().enumerate() {
-            if let Some(meta) = next_ok_meta(it, &mut pending_errors) {
-                let item = HeapItem {
+            if let Some(meta) = next_ok_meta(it, &mut pending_error) {
+                candidates[idx] = Some(HeapItem {
                     meta,
                     iter_idx: idx,
-                    file_idx: iter_file_indexes[idx],
-                };
-                if query.reverse {
-                    reverse_heap.push(item);
-                } else {
-                    forward_heap.push(Reverse(item));
-                }
+                });
             }
         }
 
         Ok(Self {
             query,
-            cursor_key,
+            cursor_start,
+            cursor_reached,
             produced: 0,
             last_emitted: None,
-            forward_heap,
-            reverse_heap,
+            candidates,
             iters,
-            pending_errors,
+            files,
+            pending_error,
             done: false,
         })
     }
 
     fn pop_next(&mut self) -> Option<HeapItem> {
-        if self.query.reverse {
-            self.reverse_heap.pop()
-        } else {
-            self.forward_heap.pop().map(|r| r.0)
+        let mut selected: Option<usize> = None;
+        for (idx, candidate) in self.candidates.iter().enumerate() {
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            let Some(best_idx) = selected else {
+                selected = Some(idx);
+                continue;
+            };
+            let Some(best) = self.candidates[best_idx] else {
+                continue;
+            };
+            let ordering = compare_meta(&candidate.meta, &best.meta);
+            let replaces = if self.query.reverse {
+                ordering == std::cmp::Ordering::Greater
+                    || (ordering == std::cmp::Ordering::Equal && candidate.iter_idx < best.iter_idx)
+            } else {
+                ordering == std::cmp::Ordering::Less
+                    || (ordering == std::cmp::Ordering::Equal && candidate.iter_idx < best.iter_idx)
+            };
+            if replaces {
+                selected = Some(idx);
+            }
         }
-    }
-
-    fn push_next(&mut self, item: HeapItem) {
-        if self.query.reverse {
-            self.reverse_heap.push(item);
-        } else {
-            self.forward_heap.push(Reverse(item));
-        }
+        selected.and_then(|idx| self.candidates[idx].take())
     }
 
     fn passes_filters(&self, meta: &EntryMeta) -> bool {
-        if let Some((cursor_meta, inclusive)) = &self.cursor_key {
-            let ord = meta.cmp_key(cursor_meta);
-            if *inclusive {
-                if ord == std::cmp::Ordering::Less {
-                    return false;
-                }
-            } else if ord != std::cmp::Ordering::Greater {
-                return false;
-            }
-        }
-
         if let Some(since) = self.query.since_realtime
             && meta.realtime_usec < since
         {
@@ -852,6 +856,37 @@ impl EagerJournalIter {
 
         true
     }
+
+    fn passes_cursor(&mut self, meta: &EntryMeta) -> bool {
+        let Some(cursor_start) = &self.cursor_start else {
+            return true;
+        };
+        if cursor_start.exact_meta().is_none() {
+            return cursor_start.accepts(meta);
+        }
+        if self.query.reverse {
+            if self.cursor_reached {
+                self.done = true;
+                return false;
+            }
+            if cursor_start.matches_exact(meta) {
+                self.cursor_reached = true;
+                if !cursor_start.inclusive() {
+                    self.done = true;
+                }
+                return cursor_start.inclusive();
+            }
+            return true;
+        }
+        if self.cursor_reached {
+            !cursor_start.matches_exact(meta)
+        } else if cursor_start.matches_exact(meta) {
+            self.cursor_reached = true;
+            cursor_start.inclusive()
+        } else {
+            false
+        }
+    }
 }
 
 impl Iterator for EagerJournalIter {
@@ -862,7 +897,7 @@ impl Iterator for EagerJournalIter {
             return None;
         }
 
-        if let Some(err) = self.pending_errors.pop() {
+        if let Some(err) = self.pending_error.take() {
             return Some(Err(err));
         }
 
@@ -883,43 +918,38 @@ impl Iterator for EagerJournalIter {
             };
 
             if let Some(next_meta) =
-                next_ok_meta(&mut self.iters[item.iter_idx], &mut self.pending_errors)
+                next_ok_meta(&mut self.iters[item.iter_idx], &mut self.pending_error)
             {
-                self.push_next(HeapItem {
+                self.candidates[item.iter_idx] = Some(HeapItem {
                     meta: next_meta,
                     iter_idx: item.iter_idx,
-                    file_idx: item.file_idx,
                 });
             }
 
+            if !self.passes_cursor(&item.meta) {
+                if self.done {
+                    return None;
+                }
+                continue;
+            }
             if !self.passes_filters(&item.meta) {
                 continue;
             }
 
-            if self.last_emitted == Some(item.meta) {
+            if self
+                .last_emitted
+                .is_some_and(|last| same_meta_entry(&last, &item.meta))
+            {
                 continue;
             }
 
-            let file = match self.query.journal.inner.open_file_by_index(item.file_idx) {
-                Ok(file) => file,
-                Err(e) => {
-                    self.pending_errors.push(e);
-                    if let Some(err) = self.pending_errors.pop() {
-                        return Some(Err(err));
-                    }
-                    continue;
-                }
-            };
-            let entry = match file.read_entry_ref(item.meta.entry_offset) {
+            let entry = match self.files[item.iter_idx].read_entry_ref(item.meta.entry_offset) {
                 Ok(e) => e,
-                Err(e) => {
-                    self.pending_errors.push(e);
-                    if let Some(err) = self.pending_errors.pop() {
-                        return Some(Err(err));
-                    }
-                    continue;
-                }
+                Err(e) => return Some(Err(e)),
             };
+            if !entry_ref_matches_query(&entry, &self.query) {
+                continue;
+            }
 
             self.last_emitted = Some(item.meta);
             self.produced = self.produced.saturating_add(1);
@@ -928,346 +958,52 @@ impl Iterator for EagerJournalIter {
     }
 }
 
-pub(super) struct LazyJournalIter {
-    query: JournalQuery,
-    cursor_key: Option<(EntryMeta, bool)>,
-    produced: usize,
-    last_emitted: Option<EntryMeta>,
-    forward_heap: BinaryHeap<Reverse<LazyHeapItem>>,
-    reverse_heap: BinaryHeap<LazyHeapItem>,
-    cache: LazyFileCache,
-    pending_errors: Vec<SdJournalError>,
-    done: bool,
+fn entry_contains_payload(entry: &EntryRef, payload: &[u8]) -> bool {
+    let Some(eq_pos) = payload.iter().position(|byte| *byte == b'=') else {
+        return false;
+    };
+    let Some(field) = payload.get(..eq_pos) else {
+        return false;
+    };
+    let Some(value) = payload.get(eq_pos.saturating_add(1)..) else {
+        return false;
+    };
+
+    entry
+        .iter_fields()
+        .any(|(name, candidate)| name.as_bytes() == field && candidate == value)
 }
 
-struct LazyFileCache {
-    capacity: usize,
-    clock: u64,
-    entries: Vec<LazyFileCursor>,
+fn compare_meta(left: &EntryMeta, right: &EntryMeta) -> std::cmp::Ordering {
+    compare_entry_keys(&entry_key_from_meta(left), &entry_key_from_meta(right))
 }
 
-struct LazyFileCursor {
-    file_idx: usize,
-    last_used: u64,
-    iter: EagerJournalIter,
+fn same_meta_entry(left: &EntryMeta, right: &EntryMeta) -> bool {
+    same_entry(&entry_key_from_meta(left), &entry_key_from_meta(right))
 }
 
-struct LazyHeapItem {
-    meta: EntryMeta,
-    entry: EntryRef,
-    file_idx: usize,
-}
-
-impl PartialEq for LazyHeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.meta == other.meta && self.file_idx == other.file_idx
-    }
-}
-
-impl Eq for LazyHeapItem {}
-
-impl PartialOrd for LazyHeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for LazyHeapItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.meta
-            .cmp_key(&other.meta)
-            .then_with(|| self.file_idx.cmp(&other.file_idx))
-    }
-}
-
-impl LazyFileCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            clock: 0,
-            entries: Vec::new(),
-        }
-    }
-
-    fn next_entry(
-        &mut self,
-        query: &JournalQuery,
-        file_idx: usize,
-        cursor_key: Option<(EntryMeta, bool)>,
-        after_meta: Option<EntryMeta>,
-    ) -> Result<Option<EntryRef>> {
-        self.clock = self.clock.saturating_add(1);
-
-        if let Some(pos) = self
-            .entries
-            .iter()
-            .position(|entry| entry.file_idx == file_idx)
-        {
-            let result =
-                next_entry_from_file_iter(&mut self.entries[pos].iter, query.reverse, after_meta);
-            return match result {
-                Ok(Some(entry)) => {
-                    self.entries[pos].last_used = self.clock;
-                    Ok(Some(entry))
-                }
-                Ok(None) => {
-                    self.entries.swap_remove(pos);
-                    Ok(None)
-                }
-                Err(err) => {
-                    self.entries.swap_remove(pos);
-                    Err(err)
-                }
-            };
-        }
-
-        let mut iter = build_lazy_file_iter(query, file_idx, cursor_key, after_meta)?;
-        match next_entry_from_file_iter(&mut iter, query.reverse, after_meta) {
-            Ok(Some(entry)) => {
-                self.insert(file_idx, iter);
-                Ok(Some(entry))
-            }
-            Ok(None) => Ok(None),
-            Err(err) => Err(err),
-        }
-    }
-
-    fn insert(&mut self, file_idx: usize, iter: EagerJournalIter) {
-        if self.entries.len() >= self.capacity
-            && let Some((idx, _)) = self
-                .entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.last_used)
-        {
-            self.entries.swap_remove(idx);
-        }
-
-        self.entries.push(LazyFileCursor {
-            file_idx,
-            last_used: self.clock,
-            iter,
-        });
-    }
-}
-
-impl LazyJournalIter {
-    fn new(query: JournalQuery) -> Result<Self> {
-        if matches!(query.limit, Some(0)) {
-            return Ok(Self {
-                query,
-                cursor_key: None,
-                produced: 0,
-                last_emitted: None,
-                forward_heap: BinaryHeap::new(),
-                reverse_heap: BinaryHeap::new(),
-                cache: LazyFileCache::new(1),
-                pending_errors: Vec::new(),
-                done: true,
-            });
-        }
-
-        let cursor_key = build_cursor_key(&query)?;
-        let mut pending_errors = Vec::new();
-        let mut forward_heap = BinaryHeap::new();
-        let mut reverse_heap = BinaryHeap::new();
-        let mut cache = LazyFileCache::new(query.journal.inner.config.max_open_files);
-        let file_indexes = matching_file_indexes(&query, cursor_key);
-
-        for file_idx in file_indexes {
-            match cache.next_entry(&query, file_idx, cursor_key, None) {
-                Ok(Some(entry)) => {
-                    let item = LazyHeapItem {
-                        meta: meta_from_entry_ref(&entry),
-                        entry,
-                        file_idx,
-                    };
-                    if query.reverse {
-                        reverse_heap.push(item);
-                    } else {
-                        forward_heap.push(Reverse(item));
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => pending_errors.push(err),
-            }
-        }
-
-        Ok(Self {
-            query,
-            cursor_key,
-            produced: 0,
-            last_emitted: None,
-            forward_heap,
-            reverse_heap,
-            cache,
-            pending_errors,
-            done: false,
-        })
-    }
-
-    fn pop_next(&mut self) -> Option<LazyHeapItem> {
-        if self.query.reverse {
-            self.reverse_heap.pop()
-        } else {
-            self.forward_heap.pop().map(|r| r.0)
-        }
-    }
-
-    fn push_next(&mut self, item: LazyHeapItem) {
-        if self.query.reverse {
-            self.reverse_heap.push(item);
-        } else {
-            self.forward_heap.push(Reverse(item));
-        }
-    }
-}
-
-impl Iterator for LazyJournalIter {
-    type Item = Result<EntryRef>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        if let Some(err) = self.pending_errors.pop() {
-            return Some(Err(err));
-        }
-
-        if let Some(limit) = self.query.limit
-            && (limit == 0 || self.produced >= limit)
-        {
-            self.done = true;
-            return None;
-        }
-
-        loop {
-            let item = match self.pop_next() {
-                Some(item) => item,
-                None => {
-                    self.done = true;
-                    return None;
-                }
-            };
-
-            match self.cache.next_entry(
-                &self.query,
-                item.file_idx,
-                self.cursor_key,
-                Some(item.meta),
-            ) {
-                Ok(Some(entry)) => {
-                    self.push_next(LazyHeapItem {
-                        meta: meta_from_entry_ref(&entry),
-                        entry,
-                        file_idx: item.file_idx,
-                    });
-                }
-                Ok(None) => {}
-                Err(err) => self.pending_errors.push(err),
-            }
-
-            if self.last_emitted == Some(item.meta) {
-                continue;
-            }
-
-            self.last_emitted = Some(item.meta);
-            self.produced = self.produced.saturating_add(1);
-            return Some(Ok(item.entry));
-        }
-    }
-}
-
-fn build_lazy_file_iter(
-    query: &JournalQuery,
-    file_idx: usize,
-    cursor_key: Option<(EntryMeta, bool)>,
-    after_meta: Option<EntryMeta>,
-) -> Result<EagerJournalIter> {
-    let file = query.journal.inner.open_file_by_index(file_idx)?;
-    let journal = journal_from_open_files(query.journal.inner.config.clone(), vec![file])?;
-    let mut q = query.clone();
-    q.journal = journal;
-    q.limit = None;
-
-    if query.reverse {
-        if let Some((meta, inclusive)) = cursor_key {
-            q.cursor_start = Some((cursor_from_meta(meta), inclusive));
-        }
-    } else if let Some(meta) = after_meta {
-        q.cursor_start = Some((cursor_from_meta(meta), false));
-    } else if let Some((meta, inclusive)) = cursor_key {
-        q.cursor_start = Some((cursor_from_meta(meta), inclusive));
-    }
-
-    EagerJournalIter::new(q)
-}
-
-fn next_entry_from_file_iter(
-    iter: &mut EagerJournalIter,
-    reverse: bool,
-    after_meta: Option<EntryMeta>,
-) -> Result<Option<EntryRef>> {
-    for item in iter {
-        let entry = item?;
-        let meta = meta_from_entry_ref(&entry);
-        if let Some(after_meta) = after_meta {
-            let ord = meta.cmp_key(&after_meta);
-            if reverse {
-                if ord != std::cmp::Ordering::Less {
-                    continue;
-                }
-            } else if ord != std::cmp::Ordering::Greater {
-                continue;
-            }
-        }
-        return Ok(Some(entry));
-    }
-
-    Ok(None)
-}
-
-fn cursor_from_meta(meta: EntryMeta) -> Cursor {
-    Cursor::new_entry_key(
-        meta.file_id,
-        meta.entry_offset,
-        meta.seqnum,
-        meta.realtime_usec,
-    )
-}
-
-fn meta_from_entry_ref(entry: &EntryRef) -> EntryMeta {
-    EntryMeta {
-        file_id: entry.file_id_raw(),
-        entry_offset: entry.entry_offset_raw(),
-        seqnum: entry.seqnum(),
-        realtime_usec: entry.realtime_usec(),
-    }
-}
-
-fn next_ok_meta<I>(it: &mut I, pending: &mut Vec<SdJournalError>) -> Option<EntryMeta>
+fn next_ok_meta<I>(it: &mut I, pending: &mut Option<SdJournalError>) -> Option<EntryMeta>
 where
     I: Iterator<Item = Result<EntryMeta>>,
 {
-    for item in it.by_ref() {
-        match item {
-            Ok(m) => return Some(m),
-            Err(e) => pending.push(e),
+    match it.next()? {
+        Ok(meta) => Some(meta),
+        Err(error) => {
+            pending.get_or_insert(error);
+            None
         }
     }
-    None
 }
 
-fn next_ok_offset<I>(it: &mut I, pending: &mut Vec<SdJournalError>) -> Option<u64>
+fn next_ok_offset<I>(it: &mut I, pending: &mut Option<SdJournalError>) -> Option<u64>
 where
     I: Iterator<Item = Result<u64>>,
 {
-    for item in it.by_ref() {
-        match item {
-            Ok(offset) => return Some(offset),
-            Err(e) => pending.push(e),
+    match it.next()? {
+        Ok(offset) => Some(offset),
+        Err(error) => {
+            pending.get_or_insert(error);
+            None
         }
     }
-    None
 }

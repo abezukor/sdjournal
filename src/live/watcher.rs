@@ -28,6 +28,7 @@ pub(super) struct InotifyWatcher {
     inotify: OwnedFd,
     buffer: Vec<MaybeUninit<u8>>,
     targets: HashMap<i32, WatchTarget>,
+    complete: bool,
 }
 
 impl InotifyWatcher {
@@ -48,20 +49,28 @@ impl InotifyWatcher {
             | inotify::WatchFlags::DELETE_SELF;
 
         let mut targets = HashMap::new();
+        let mut complete = true;
         for path in watch_paths {
             let Some(kind) = watch_kind(path) else {
+                complete = false;
                 continue;
             };
             let Ok(wd) = inotify::add_watch(&inotify, path.as_os_str().as_bytes(), mask) else {
+                complete = false;
                 continue;
             };
-            targets.insert(
-                wd,
-                WatchTarget {
-                    path: path.clone(),
-                    kind,
-                },
-            );
+            if targets
+                .insert(
+                    wd,
+                    WatchTarget {
+                        path: path.clone(),
+                        kind,
+                    },
+                )
+                .is_some()
+            {
+                complete = false;
+            }
         }
 
         if targets.is_empty() {
@@ -72,8 +81,13 @@ impl InotifyWatcher {
             inotify,
             buffer: vec![MaybeUninit::uninit(); 4096],
             targets,
+            complete,
         };
         Some(watcher)
+    }
+
+    pub(super) fn is_complete(&self) -> bool {
+        self.complete
     }
 
     pub(super) fn wait(&mut self, timeout: Duration) -> WatchChange {
@@ -163,7 +177,9 @@ fn apply_event(
         | inotify::ReadFlags::MOVED_FROM
         | inotify::ReadFlags::MOVED_TO
         | inotify::ReadFlags::MOVE_SELF
-        | inotify::ReadFlags::DELETE_SELF;
+        | inotify::ReadFlags::DELETE_SELF
+        | inotify::ReadFlags::IGNORED
+        | inotify::ReadFlags::UNMOUNT;
 
     if flags.intersects(topology_flags) {
         change.topology_changed = true;

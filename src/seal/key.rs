@@ -13,18 +13,10 @@ impl VerificationKey {
         &self.seed
     }
 
-    #[expect(
-        dead_code,
-        reason = "seal timing metadata is reserved for future verification checks"
-    )]
     pub(crate) fn start_usec(&self) -> u64 {
         self.start_usec
     }
 
-    #[expect(
-        dead_code,
-        reason = "seal timing metadata is reserved for future verification checks"
-    )]
     pub(crate) fn interval_usec(&self) -> u64 {
         self.interval_usec
     }
@@ -99,9 +91,9 @@ pub(crate) fn parse_verification_key(s: &str) -> Result<VerificationKey> {
         u64::from_str_radix(interval_s, 16).map_err(|_| SdJournalError::InvalidQuery {
             reason: "verification key interval is not valid hex".to_string(),
         })?;
-    if interval == 0 {
+    if start == 0 || interval == 0 {
         return Err(SdJournalError::InvalidQuery {
-            reason: "verification key interval must be non-zero".to_string(),
+            reason: "verification key start and interval must be non-zero".to_string(),
         });
     }
 
@@ -133,5 +125,15 @@ mod tests {
         );
         assert_eq!(k.start_usec, 0x10);
         assert_eq!(k.interval_usec, 0x10);
+    }
+
+    #[test]
+    fn verification_key_rejects_zero_start_or_interval() {
+        for key in [
+            "01-23-45-67-89-ab-cd-ef-01-23-45-67/0-10",
+            "01-23-45-67-89-ab-cd-ef-01-23-45-67/1-0",
+        ] {
+            assert!(parse_verification_key(key).is_err(), "{key}");
+        }
     }
 }

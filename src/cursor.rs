@@ -1,5 +1,6 @@
 use crate::error::{Result, SdJournalError};
 use crate::util::{hex_decode, hex_encode};
+use std::cmp::Ordering;
 use std::fmt;
 
 const PREFIX_V1: &str = "SJ1:";
@@ -8,6 +9,7 @@ const TAG_FILE_OFFSET: u8 = 0x01;
 const TAG_SYSTEMD_RAW: u8 = 0x02;
 const TAG_SYSTEMD_FIELDS: u8 = 0x03;
 const TAG_ENTRY_KEY: u8 = 0x04;
+const TAG_LOCATION_KEY: u8 = 0x05;
 
 const SYSTEMD_MASK_SEQNUM_ID: u8 = 1 << 0;
 const SYSTEMD_MASK_SEQNUM: u8 = 1 << 1;
@@ -22,16 +24,29 @@ enum CursorKind {
         file_id: [u8; 16],
         entry_offset: u64,
     },
-    EntryKey(SdJournalEntryKey),
+    LegacyEntryKey(LegacyEntryKey),
+    LocationKey(SdJournalEntryKey),
     Systemd(SystemdCursor),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct LegacyEntryKey {
+    pub(crate) file_id: [u8; 16],
+    pub(crate) entry_offset: u64,
+    pub(crate) seqnum: u64,
+    pub(crate) realtime_usec: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SdJournalEntryKey {
     pub(crate) file_id: [u8; 16],
     pub(crate) entry_offset: u64,
+    pub(crate) seqnum_id: [u8; 16],
     pub(crate) seqnum: u64,
+    pub(crate) boot_id: [u8; 16],
+    pub(crate) monotonic_usec: u64,
     pub(crate) realtime_usec: u64,
+    pub(crate) xor_hash: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -67,6 +82,41 @@ impl SystemdCursor {
     }
 }
 
+/// Compare two complete journal locations using systemd's stable merge ordering.
+///
+/// This intentionally may return [`Ordering::Equal`] for the same logical entry copied into two
+/// different files. The conditional relation is not transitive across unrelated sequence/boot
+/// streams, so it must only be used for systemd-style pairwise selection or boundary comparison;
+/// it must not back [`Ord`], `sort_by`, or a binary heap.
+pub(crate) fn compare_entry_keys(left: &SdJournalEntryKey, right: &SdJournalEntryKey) -> Ordering {
+    if left.seqnum_id == right.seqnum_id {
+        let ord = left.seqnum.cmp(&right.seqnum);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+
+    if left.boot_id == right.boot_id {
+        let ord = left.monotonic_usec.cmp(&right.monotonic_usec);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+
+    left.realtime_usec
+        .cmp(&right.realtime_usec)
+        .then_with(|| left.xor_hash.cmp(&right.xor_hash))
+}
+
+pub(crate) fn same_entry(left: &SdJournalEntryKey, right: &SdJournalEntryKey) -> bool {
+    left.seqnum_id == right.seqnum_id
+        && left.seqnum == right.seqnum
+        && left.boot_id == right.boot_id
+        && left.monotonic_usec == right.monotonic_usec
+        && left.realtime_usec == right.realtime_usec
+        && left.xor_hash == right.xor_hash
+}
+
 /// Opaque cursor for checkpointing and resuming journal iteration.
 ///
 /// A cursor can be round-tripped through [`std::string::ToString::to_string`] and
@@ -78,6 +128,7 @@ pub struct Cursor {
 }
 
 impl Cursor {
+    #[cfg(test)]
     pub(crate) fn new_entry_key(
         file_id: [u8; 16],
         entry_offset: u64,
@@ -85,12 +136,18 @@ impl Cursor {
         realtime_usec: u64,
     ) -> Self {
         Self {
-            kind: CursorKind::EntryKey(SdJournalEntryKey {
+            kind: CursorKind::LegacyEntryKey(LegacyEntryKey {
                 file_id,
                 entry_offset,
                 seqnum,
                 realtime_usec,
             }),
+        }
+    }
+
+    pub(crate) fn new_location_key(key: SdJournalEntryKey) -> Self {
+        Self {
+            kind: CursorKind::LocationKey(key),
         }
     }
 
@@ -100,22 +157,36 @@ impl Cursor {
                 file_id,
                 entry_offset,
             } => Some((*file_id, *entry_offset)),
-            CursorKind::EntryKey(k) => Some((k.file_id, k.entry_offset)),
+            CursorKind::LegacyEntryKey(k) => Some((k.file_id, k.entry_offset)),
+            CursorKind::LocationKey(k) => Some((k.file_id, k.entry_offset)),
             CursorKind::Systemd(_) => None,
         }
     }
 
     pub(crate) fn sdjournal_entry_key(&self) -> Option<SdJournalEntryKey> {
         match &self.kind {
-            CursorKind::EntryKey(k) => Some(*k),
-            CursorKind::FileOffset { .. } | CursorKind::Systemd(_) => None,
+            CursorKind::LocationKey(k) => Some(*k),
+            CursorKind::FileOffset { .. }
+            | CursorKind::LegacyEntryKey(_)
+            | CursorKind::Systemd(_) => None,
+        }
+    }
+
+    pub(crate) fn legacy_entry_key(&self) -> Option<LegacyEntryKey> {
+        match &self.kind {
+            CursorKind::LegacyEntryKey(k) => Some(*k),
+            CursorKind::FileOffset { .. } | CursorKind::LocationKey(_) | CursorKind::Systemd(_) => {
+                None
+            }
         }
     }
 
     pub(crate) fn systemd(&self) -> Option<&SystemdCursor> {
         match &self.kind {
             CursorKind::Systemd(v) => Some(v),
-            CursorKind::FileOffset { .. } | CursorKind::EntryKey(_) => None,
+            CursorKind::FileOffset { .. }
+            | CursorKind::LegacyEntryKey(_)
+            | CursorKind::LocationKey(_) => None,
         }
     }
 
@@ -171,11 +242,54 @@ impl Cursor {
                     realtime.copy_from_slice(&bytes[33..41]);
 
                     Ok(Cursor {
-                        kind: CursorKind::EntryKey(SdJournalEntryKey {
+                        kind: CursorKind::LegacyEntryKey(LegacyEntryKey {
                             file_id,
                             entry_offset: u64::from_le_bytes(entry_offset),
                             seqnum: u64::from_le_bytes(seqnum),
                             realtime_usec: u64::from_le_bytes(realtime),
+                        }),
+                    })
+                }
+                TAG_LOCATION_KEY => {
+                    const LOCATION_KEY_LEN: usize = 1 + 16 + 8 + 16 + 8 + 16 + 8 + 8 + 8;
+                    if bytes.len() != LOCATION_KEY_LEN {
+                        return Err(SdJournalError::InvalidQuery {
+                            reason: "invalid cursor length for SJ1 LocationKey".to_string(),
+                        });
+                    }
+
+                    let mut input = &bytes[1..];
+                    fn take<const N: usize>(input: &mut &[u8]) -> Result<[u8; N]> {
+                        let (head, tail) = input.split_at_checked(N).ok_or_else(|| {
+                            SdJournalError::InvalidQuery {
+                                reason: "truncated SJ1 LocationKey".to_string(),
+                            }
+                        })?;
+                        *input = tail;
+                        head.try_into().map_err(|_| SdJournalError::InvalidQuery {
+                            reason: "invalid SJ1 LocationKey field width".to_string(),
+                        })
+                    }
+
+                    let file_id = take::<16>(&mut input)?;
+                    let entry_offset = u64::from_le_bytes(take::<8>(&mut input)?);
+                    let seqnum_id = take::<16>(&mut input)?;
+                    let seqnum = u64::from_le_bytes(take::<8>(&mut input)?);
+                    let boot_id = take::<16>(&mut input)?;
+                    let monotonic_usec = u64::from_le_bytes(take::<8>(&mut input)?);
+                    let realtime_usec = u64::from_le_bytes(take::<8>(&mut input)?);
+                    let xor_hash = u64::from_le_bytes(take::<8>(&mut input)?);
+
+                    Ok(Cursor {
+                        kind: CursorKind::LocationKey(SdJournalEntryKey {
+                            file_id,
+                            entry_offset,
+                            seqnum_id,
+                            seqnum,
+                            boot_id,
+                            monotonic_usec,
+                            realtime_usec,
+                            xor_hash,
                         }),
                     })
                 }
@@ -216,12 +330,28 @@ impl fmt::Display for Cursor {
                 bytes.extend_from_slice(file_id);
                 bytes.extend_from_slice(&entry_offset.to_le_bytes());
             }
-            CursorKind::EntryKey(k) => {
+            CursorKind::LegacyEntryKey(k) => {
                 bytes.push(TAG_ENTRY_KEY);
                 bytes.extend_from_slice(&k.file_id);
                 bytes.extend_from_slice(&k.entry_offset.to_le_bytes());
                 bytes.extend_from_slice(&k.seqnum.to_le_bytes());
                 bytes.extend_from_slice(&k.realtime_usec.to_le_bytes());
+            }
+            CursorKind::LocationKey(k) => {
+                // Emit the long-supported systemd cursor variant so checkpoints remain readable
+                // by older sdjournal releases during a rolling upgrade or rollback. We still
+                // accept TAG_LOCATION_KEY above for checkpoints produced by intermediate builds.
+                bytes.push(TAG_SYSTEMD_RAW);
+                let raw = format!(
+                    "s={};i={:x};b={};m={:x};t={:x};x={:x}",
+                    crate::util::hex_encode(&k.seqnum_id),
+                    k.seqnum,
+                    crate::util::hex_encode(&k.boot_id),
+                    k.monotonic_usec,
+                    k.realtime_usec,
+                    k.xor_hash,
+                );
+                bytes.extend_from_slice(raw.as_bytes());
             }
             CursorKind::Systemd(fields) => {
                 if let Some(raw) = fields.systemd_wire_string() {
@@ -484,15 +614,74 @@ mod tests {
 
         let parsed = Cursor::parse(&s).unwrap();
         assert_eq!(
-            parsed.sdjournal_entry_key(),
-            Some(SdJournalEntryKey {
+            parsed.legacy_entry_key(),
+            Some(LegacyEntryKey {
                 file_id,
                 entry_offset,
                 seqnum,
                 realtime_usec
             })
         );
+        assert!(parsed.sdjournal_entry_key().is_none());
         assert_eq!(parsed.to_string(), s);
+    }
+
+    #[test]
+    fn cursor_location_key_roundtrip() {
+        let key = SdJournalEntryKey {
+            file_id: [0x11; 16],
+            entry_offset: 0x1122_3344_5566_7788,
+            seqnum_id: [0x22; 16],
+            seqnum: 0x99aa_bbcc,
+            boot_id: [0x33; 16],
+            monotonic_usec: 0x4455,
+            realtime_usec: 0x6677,
+            xor_hash: 0x8899,
+        };
+        let cursor = Cursor::new_location_key(key);
+        let encoded = cursor.to_string();
+
+        let parsed = Cursor::parse(&encoded).unwrap();
+        let systemd = parsed.systemd().unwrap();
+        assert_eq!(systemd.seqnum_id, Some(key.seqnum_id));
+        assert_eq!(systemd.seqnum, Some(key.seqnum));
+        assert_eq!(systemd.boot_id, Some(key.boot_id));
+        assert_eq!(systemd.monotonic_usec, Some(key.monotonic_usec));
+        assert_eq!(systemd.realtime_usec, Some(key.realtime_usec));
+        assert_eq!(systemd.xor_hash, Some(key.xor_hash));
+        assert_eq!(parsed.file_offset(), None);
+        assert_eq!(parsed.to_string(), encoded);
+    }
+
+    #[test]
+    fn entry_key_comparison_uses_systemd_priority() {
+        let base = SdJournalEntryKey {
+            file_id: [1; 16],
+            entry_offset: 1,
+            seqnum_id: [2; 16],
+            seqnum: 10,
+            boot_id: [3; 16],
+            monotonic_usec: 100,
+            realtime_usec: 1_000,
+            xor_hash: 9,
+        };
+
+        let mut later_sequence = base;
+        later_sequence.seqnum = 11;
+        later_sequence.realtime_usec = 1;
+        assert_eq!(compare_entry_keys(&base, &later_sequence), Ordering::Less);
+
+        let mut later_monotonic = base;
+        later_monotonic.seqnum_id = [4; 16];
+        later_monotonic.monotonic_usec = 101;
+        later_monotonic.realtime_usec = 1;
+        assert_eq!(compare_entry_keys(&base, &later_monotonic), Ordering::Less);
+
+        let mut copied = base;
+        copied.file_id = [5; 16];
+        copied.entry_offset = 99;
+        assert_eq!(compare_entry_keys(&base, &copied), Ordering::Equal);
+        assert!(same_entry(&base, &copied));
     }
 
     #[test]

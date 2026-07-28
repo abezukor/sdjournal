@@ -48,7 +48,15 @@ impl JournalFile {
     pub(crate) fn find_data_objects(&self, payload: &[u8]) -> Result<Vec<DataObjectRef>> {
         let table_offset = self.inner.header.data_hash_table_offset;
         let table_size = self.inner.header.data_hash_table_size;
-        if table_offset == 0 || table_size == 0 {
+        if (table_offset == 0) != (table_size == 0) {
+            return Err(self.metadata_error(
+                Some(if table_offset == 0 { 104 } else { 112 }),
+                format!(
+                    "inconsistent DATA_HASH_TABLE metadata (offset={table_offset}, size={table_size})"
+                ),
+            ));
+        }
+        if table_offset == 0 {
             return Ok(Vec::new());
         }
         if !table_size.is_multiple_of(16) {
@@ -57,6 +65,12 @@ impl JournalFile {
                 offset: Some(table_offset),
                 reason: "DATA_HASH_TABLE size is not a multiple of 16".to_string(),
             });
+        }
+        if !table_offset.is_multiple_of(8) {
+            return Err(self.metadata_error(
+                Some(table_offset),
+                format!("DATA_HASH_TABLE offset is not 8-byte aligned: {table_offset}"),
+            ));
         }
 
         let buckets = table_size / 16;
@@ -72,9 +86,22 @@ impl JournalFile {
             "data_hash_table index",
         )?;
         let item = self.read_hash_item(item_offset)?;
+        if (item.head_hash_offset == 0) != (item.tail_hash_offset == 0) {
+            return Err(self.metadata_error(
+                Some(item_offset),
+                "DATA_HASH_TABLE bucket has inconsistent head/tail offsets",
+            ));
+        }
+        if item.tail_hash_offset != 0 && item.tail_hash_offset < item.head_hash_offset {
+            return Err(self.metadata_error(
+                Some(item_offset),
+                "DATA_HASH_TABLE bucket tail precedes its head",
+            ));
+        }
 
         let mut out = Vec::new();
         let mut current = item.head_hash_offset;
+        let mut last = 0;
         let mut steps = 0usize;
         while current != 0 {
             steps = steps.saturating_add(1);
@@ -98,7 +125,24 @@ impl JournalFile {
                 }
             }
 
-            current = meta.next_hash_offset;
+            last = current;
+            let next = meta.next_hash_offset;
+            if next != 0 && next <= current {
+                return Err(self.metadata_error(
+                    Some(current),
+                    format!("DATA hash chain does not move forward ({next} <= {current})"),
+                ));
+            }
+            current = next;
+        }
+        if last != item.tail_hash_offset {
+            return Err(self.metadata_error(
+                Some(item_offset),
+                format!(
+                    "DATA_HASH_TABLE bucket tail does not match its chain ({last} != {})",
+                    item.tail_hash_offset
+                ),
+            ));
         }
 
         Ok(out)
@@ -110,6 +154,15 @@ impl JournalFile {
         reverse: bool,
     ) -> Result<DataEntryOffsetIter> {
         DataEntryOffsetIter::new(self.clone(), data, reverse)
+    }
+
+    pub(crate) fn data_entry_offsets_after_offset(
+        &self,
+        data: DataObjectRef,
+        reverse: bool,
+        after_entry_offset: u64,
+    ) -> Result<DataEntryOffsetIter> {
+        DataEntryOffsetIter::new_after_offset(self.clone(), data, reverse, Some(after_entry_offset))
     }
 
     fn payload_hash(&self, payload: &[u8]) -> u64 {
@@ -140,6 +193,13 @@ impl JournalFile {
     }
 
     fn read_data_object_meta(&self, offset: u64) -> Result<DataObjectMeta> {
+        self.validate_object_offset(offset)?;
+        if !offset.is_multiple_of(8) {
+            return Err(self.metadata_error(
+                Some(offset),
+                format!("DATA object offset is not 8-byte aligned: {offset}"),
+            ));
+        }
         let oh_bytes = self.read_bytes(offset, 16)?;
         let oh = ObjectHeader::parse(oh_bytes.as_slice(), self.path(), offset)?;
         if oh.object_type != OBJECT_DATA {
@@ -161,6 +221,24 @@ impl JournalFile {
                 offset: Some(offset),
                 reason: format!("DATA object too small: {}", oh.size),
             });
+        }
+        if oh.size > self.inner.config.max_object_size_bytes {
+            return Err(SdJournalError::LimitExceeded {
+                kind: LimitKind::ObjectSizeBytes,
+                limit: self.inner.config.max_object_size_bytes,
+            });
+        }
+        let end = offset
+            .checked_add(oh.size)
+            .ok_or_else(|| self.metadata_error(Some(offset), "DATA object range overflow"))?;
+        if end > self.inner.used_size {
+            return Err(self.metadata_error(
+                Some(offset),
+                format!(
+                    "DATA object extends beyond used journal data (end={end}, used_size={})",
+                    self.inner.used_size
+                ),
+            ));
         }
 
         let buf = self.read_bytes(offset, usize::try_from(min_size).unwrap_or(usize::MAX))?;

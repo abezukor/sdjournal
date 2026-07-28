@@ -79,6 +79,18 @@
 
 #![deny(missing_docs, unsafe_op_in_unsafe_fn)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::dbg_macro,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
+)]
 
 mod config;
 mod cursor;

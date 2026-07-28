@@ -11,14 +11,8 @@ use self::execute::JournalIter;
 
 #[derive(Debug, Clone)]
 enum MatchTerm {
-    Exact {
-        field: String,
-        value: Vec<u8>,
-        payload: Vec<u8>,
-    },
-    Present {
-        field: String,
-    },
+    Exact { payload: Vec<u8>, eq_pos: usize },
+    Present { field: String },
 }
 
 /// A query builder for reading entries from a [`Journal`].
@@ -101,7 +95,7 @@ impl JournalQuery {
             return self;
         }
         if let Err(e) = validate_field_name(field, &self.journal.inner.config) {
-            self.invalid_reason = Some(e.to_string());
+            self.invalid_reason = Some(invalid_query_reason(e));
             return self;
         }
         if self.count_terms() >= self.journal.inner.config.max_query_terms {
@@ -116,9 +110,8 @@ impl JournalQuery {
         payload.extend_from_slice(value);
 
         self.global_terms.push(MatchTerm::Exact {
-            field: field.to_string(),
-            value: value.to_vec(),
             payload,
+            eq_pos: field.len(),
         });
         self
     }
@@ -133,7 +126,7 @@ impl JournalQuery {
             return self;
         }
         if let Err(e) = validate_field_name(field, &self.journal.inner.config) {
-            self.invalid_reason = Some(e.to_string());
+            self.invalid_reason = Some(invalid_query_reason(e));
             return self;
         }
         if self.count_terms() >= self.journal.inner.config.max_query_terms {
@@ -194,9 +187,8 @@ impl JournalQuery {
             payload.push(b'=');
             payload.extend_from_slice(unit);
             MatchTerm::Exact {
-                field: field.to_string(),
-                value: unit.to_vec(),
                 payload,
+                eq_pos: field.len(),
             }
         }
 
@@ -348,7 +340,10 @@ impl JournalQuery {
     /// Collect all matching entries into owned values.
     ///
     /// This is a convenience wrapper around [`JournalQuery::iter`] plus
-    /// [`EntryRef::to_owned`](crate::EntryRef::to_owned).
+    /// [`EntryRef::to_owned`](crate::EntryRef::to_owned). Unless [`JournalQuery::limit`] has been
+    /// set, this method may allocate memory proportional to every matching entry. Prefer
+    /// [`JournalQuery::collect_owned_limited`] when processing untrusted or potentially large
+    /// journals.
     pub fn collect_owned(&self) -> Result<Vec<EntryOwned>> {
         let mut out = Vec::new();
         for item in self.iter()? {
@@ -356,6 +351,20 @@ impl JournalQuery {
             out.push(entry.to_owned());
         }
         Ok(out)
+    }
+
+    /// Collect at most `max_entries` matching entries into owned values.
+    ///
+    /// This applies the lower of `max_entries` and any existing [`JournalQuery::limit`] without
+    /// mutating the query. Passing `0` returns an empty vector.
+    pub fn collect_owned_limited(&self, max_entries: usize) -> Result<Vec<EntryOwned>> {
+        let mut query = self.clone();
+        query.limit = Some(
+            query
+                .limit
+                .map_or(max_entries, |limit| limit.min(max_entries)),
+        );
+        query.collect_owned()
     }
 
     pub(crate) fn set_cursor_start(&mut self, cursor: Cursor, inclusive: bool) -> Result<()> {
@@ -414,7 +423,7 @@ impl OrGroupBuilder {
             return self;
         }
         if let Err(e) = validate_field_name(field, &self.config) {
-            self.invalid_reason = Some(e.to_string());
+            self.invalid_reason = Some(invalid_query_reason(e));
             return self;
         }
         if self.terms.len() >= self.remaining {
@@ -428,9 +437,8 @@ impl OrGroupBuilder {
         payload.extend_from_slice(value);
 
         self.terms.push(MatchTerm::Exact {
-            field: field.to_string(),
-            value: value.to_vec(),
             payload,
+            eq_pos: field.len(),
         });
         self
     }
@@ -441,7 +449,7 @@ impl OrGroupBuilder {
             return self;
         }
         if let Err(e) = validate_field_name(field, &self.config) {
-            self.invalid_reason = Some(e.to_string());
+            self.invalid_reason = Some(invalid_query_reason(e));
             return self;
         }
         if self.terms.len() >= self.remaining {
@@ -456,6 +464,11 @@ impl OrGroupBuilder {
 }
 
 fn validate_field_name(field: &str, config: &crate::config::JournalConfig) -> Result<()> {
+    if field.is_empty() {
+        return Err(SdJournalError::InvalidQuery {
+            reason: "field name must not be empty".to_string(),
+        });
+    }
     if field.len() > config.max_field_name_len {
         return Err(SdJournalError::InvalidQuery {
             reason: "field name too long".to_string(),
@@ -467,6 +480,13 @@ fn validate_field_name(field: &str, config: &crate::config::JournalConfig) -> Re
         });
     }
     Ok(())
+}
+
+fn invalid_query_reason(error: SdJournalError) -> String {
+    match error {
+        SdJournalError::InvalidQuery { reason } => reason,
+        other => other.to_string(),
+    }
 }
 
 fn build_branches(query: &JournalQuery) -> Vec<Vec<MatchTerm>> {
@@ -483,13 +503,47 @@ fn build_branches(query: &JournalQuery) -> Vec<Vec<MatchTerm>> {
     out
 }
 
+#[cfg(test)]
 fn term_matches(entry: &EntryOwned, term: &MatchTerm) -> bool {
     match term {
-        MatchTerm::Exact { field, value, .. } => entry
-            .iter_fields()
-            .any(|(k, v)| k == field.as_str() && v == value.as_slice()),
+        MatchTerm::Exact { payload, eq_pos } => {
+            let (field, value) = payload.split_at(*eq_pos);
+            let value = value.get(1..).unwrap_or_default();
+            entry
+                .iter_fields()
+                .any(|(k, v)| k.as_bytes() == field && v == value)
+        }
         MatchTerm::Present { field } => entry.get(field).is_some(),
     }
+}
+
+fn term_matches_ref(entry: &EntryRef, term: &MatchTerm) -> bool {
+    match term {
+        MatchTerm::Exact { payload, eq_pos } => {
+            let (field, value) = payload.split_at(*eq_pos);
+            let value = value.get(1..).unwrap_or_default();
+            entry
+                .iter_fields()
+                .any(|(k, v)| k.as_bytes() == field && v == value)
+        }
+        MatchTerm::Present { field } => entry.get(field).is_some(),
+    }
+}
+
+fn entry_ref_matches_query(entry: &EntryRef, query: &JournalQuery) -> bool {
+    if !query
+        .global_terms
+        .iter()
+        .all(|term| term_matches_ref(entry, term))
+    {
+        return false;
+    }
+
+    query.or_groups.is_empty()
+        || query
+            .or_groups
+            .iter()
+            .any(|group| group.iter().all(|term| term_matches_ref(entry, term)))
 }
 
 #[cfg(test)]
@@ -517,6 +571,20 @@ mod tests {
         match q.iter() {
             Ok(_) => panic!("expected InvalidQuery"),
             Err(err) => assert!(matches!(err, SdJournalError::InvalidQuery { .. })),
+        }
+    }
+
+    #[test]
+    fn empty_field_name_rejected_on_iter() {
+        let journal = empty_journal_with_config(JournalConfig::default());
+        let mut q = JournalQuery::new(journal);
+        q.match_present("");
+        match q.iter() {
+            Ok(_) => panic!("expected InvalidQuery"),
+            Err(SdJournalError::InvalidQuery { reason }) => {
+                assert_eq!(reason, "field name must not be empty");
+            }
+            Err(err) => panic!("unexpected error: {err}"),
         }
     }
 
@@ -560,15 +628,12 @@ mod tests {
         let unit_fields: std::collections::BTreeSet<&str> = branches
             .iter()
             .map(|b| match &b[1] {
-                MatchTerm::Exact {
-                    field,
-                    value,
-                    payload,
-                } => {
-                    assert_eq!(value, b"sshd.service");
-                    let expected = [field.as_bytes(), b"=", value.as_slice()].concat();
+                MatchTerm::Exact { payload, eq_pos } => {
+                    let field = std::str::from_utf8(&payload[..*eq_pos]).unwrap();
+                    assert_eq!(&payload[eq_pos + 1..], b"sshd.service");
+                    let expected = [field.as_bytes(), b"=", b"sshd.service"].concat();
                     assert_eq!(payload, &expected);
-                    field.as_str()
+                    field
                 }
                 _ => panic!("expected exact unit match term"),
             })
@@ -757,12 +822,16 @@ mod tests {
     #[test]
     fn term_matches_handles_exact_and_present_terms() {
         let entry = EntryOwned::new(
-            [0x11; 16],
-            7,
-            9,
-            11,
-            13,
-            [0x22; 16],
+            crate::cursor::SdJournalEntryKey {
+                file_id: [0x11; 16],
+                entry_offset: 7,
+                seqnum_id: [0x12; 16],
+                seqnum: 9,
+                realtime_usec: 11,
+                monotonic_usec: 13,
+                boot_id: [0x22; 16],
+                xor_hash: 15,
+            },
             vec![
                 ("MESSAGE".to_string(), b"hello".to_vec()),
                 ("PRIORITY".to_string(), b"6".to_vec()),
@@ -772,17 +841,15 @@ mod tests {
         assert!(term_matches(
             &entry,
             &MatchTerm::Exact {
-                field: "MESSAGE".to_string(),
-                value: b"hello".to_vec(),
                 payload: b"MESSAGE=hello".to_vec(),
+                eq_pos: 7,
             }
         ));
         assert!(!term_matches(
             &entry,
             &MatchTerm::Exact {
-                field: "MESSAGE".to_string(),
-                value: b"nope".to_vec(),
                 payload: b"MESSAGE=nope".to_vec(),
+                eq_pos: 7,
             }
         ));
         assert!(term_matches(
@@ -812,9 +879,6 @@ mod tests {
         assert!(q.invalid_reason.is_none());
 
         q.match_present("ABCD");
-        assert_eq!(
-            q.invalid_reason.as_deref(),
-            Some("invalid query: field name too long")
-        );
+        assert_eq!(q.invalid_reason.as_deref(), Some("field name too long"));
     }
 }

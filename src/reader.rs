@@ -2,13 +2,11 @@ use crate::error::{Result, SdJournalError};
 #[cfg(test)]
 use crate::util::checked_add_u64;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(feature = "mmap")]
 use memmap2::Mmap;
-#[cfg(feature = "mmap")]
-use std::path::Path;
 
 /// A byte buffer returned by `RandomAccess`.
 ///
@@ -73,8 +71,17 @@ impl FileAccess {
 
     pub(crate) fn read_known_valid(&self, offset: u64, len: usize) -> Result<ByteBuf> {
         let mut buf = vec![0u8; len];
-        read_exact_at(self.file.as_ref(), offset, &mut buf)
-            .map_err(|e| SdJournalError::io("read_at", Some(self.path.clone()), e))?;
+        if let Err(e) = read_exact_at(self.file.as_ref(), offset, &mut buf) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Err(SdJournalError::Transient {
+                    path: Some(self.path.clone()),
+                    reason: format!(
+                        "file was truncated while reading (offset={offset}, len={len})"
+                    ),
+                });
+            }
+            return Err(SdJournalError::io("read_at", Some(self.path.clone()), e));
+        }
         Ok(ByteBuf::from_vec(buf))
     }
 
@@ -98,6 +105,71 @@ impl FileAccess {
         }
 
         self.read_known_valid(offset, len)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ReopenAccess {
+    path: PathBuf,
+    expected_file_id: [u8; 16],
+    expected_seqnum_id: [u8; 16],
+}
+
+impl ReopenAccess {
+    pub(crate) fn new(
+        path: PathBuf,
+        expected_file_id: [u8; 16],
+        expected_seqnum_id: [u8; 16],
+    ) -> Self {
+        Self {
+            path,
+            expected_file_id,
+            expected_seqnum_id,
+        }
+    }
+
+    pub(crate) fn read_known_valid(&self, offset: u64, len: usize) -> Result<ByteBuf> {
+        let file = File::open(&self.path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                SdJournalError::PermissionDenied {
+                    path: self.path.clone(),
+                }
+            } else {
+                SdJournalError::io("open", Some(self.path.clone()), error)
+            }
+        })?;
+
+        let mut identity = [0u8; 88];
+        if let Err(error) = read_exact_at(&file, 0, &mut identity) {
+            return Err(read_failure(&self.path, 0, identity.len(), error));
+        }
+        let file_id = identity.get(24..40);
+        let seqnum_id = identity.get(72..88);
+        if file_id != Some(self.expected_file_id.as_slice())
+            || seqnum_id != Some(self.expected_seqnum_id.as_slice())
+        {
+            return Err(SdJournalError::Transient {
+                path: Some(self.path.clone()),
+                reason: "journal file was replaced after discovery".to_string(),
+            });
+        }
+
+        let mut buf = vec![0u8; len];
+        if let Err(error) = read_exact_at(&file, offset, &mut buf) {
+            return Err(read_failure(&self.path, offset, len, error));
+        }
+        Ok(ByteBuf::from_vec(buf))
+    }
+}
+
+fn read_failure(path: &Path, offset: u64, len: usize, error: std::io::Error) -> SdJournalError {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        SdJournalError::Transient {
+            path: Some(path.to_path_buf()),
+            reason: format!("file was truncated while reading (offset={offset}, len={len})"),
+        }
+    } else {
+        SdJournalError::io("read_at", Some(path.to_path_buf()), error)
     }
 }
 
@@ -245,6 +317,29 @@ mod tests {
             }) => {
                 assert_eq!(err_path, Some(path));
                 assert_eq!(reason, "read beyond end of file (file_len=6, end=7)");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_access_reports_concurrent_truncation_as_transient() {
+        let (_dir, path, file) = temp_file(b"abcdef");
+        let access = FileAccess::new(path.clone(), file);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(2)
+            .unwrap();
+
+        match access.read_known_valid(0, 6) {
+            Err(SdJournalError::Transient {
+                path: err_path,
+                reason,
+            }) => {
+                assert_eq!(err_path, Some(path));
+                assert_eq!(reason, "file was truncated while reading (offset=0, len=6)");
             }
             other => panic!("unexpected result: {other:?}"),
         }

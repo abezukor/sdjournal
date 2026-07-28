@@ -35,7 +35,7 @@ pub(crate) fn read_id128(buf: &[u8], offset: usize) -> Option<[u8; 16]> {
 }
 
 pub(crate) fn is_ascii_field_name(name: &[u8]) -> bool {
-    name.iter().all(|&b| b.is_ascii() && b != b'=' && b != 0)
+    !name.is_empty() && name.iter().all(|&b| b.is_ascii() && b != b'=' && b != 0)
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
@@ -271,6 +271,7 @@ mod tests {
     fn ascii_field_name_validation_rejects_forbidden_bytes() {
         assert!(is_ascii_field_name(b"MESSAGE"));
         assert!(is_ascii_field_name(b"_SYSTEMD_UNIT"));
+        assert!(!is_ascii_field_name(b""));
         assert!(!is_ascii_field_name(b"BAD=FIELD"));
         assert!(!is_ascii_field_name(b"BAD\0FIELD"));
         assert!(!is_ascii_field_name("字段".as_bytes()));

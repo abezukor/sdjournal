@@ -46,34 +46,181 @@ pub(super) fn decompress_zstd(src: &[u8], max: usize) -> Result<Vec<u8>> {
     use ruzstd::decoding::StreamingDecoder;
     use ruzstd::io::Read as _;
 
+    const DEFAULT_WORKING_SET_LIMIT: usize = 8 * 1024 * 1024;
     let mut reader: &[u8] = src;
-    let mut decoder =
-        StreamingDecoder::new(&mut reader).map_err(|e| SdJournalError::DecompressFailed {
-            algo: CompressionAlgo::Zstd,
-            reason: e.to_string(),
-        })?;
-
     let mut out = Vec::new();
     let mut buf = [0u8; 16 * 1024];
-    loop {
-        let n = decoder
-            .read(&mut buf)
-            .map_err(|e| SdJournalError::DecompressFailed {
-                algo: CompressionAlgo::Zstd,
-                reason: e.to_string(),
-            })?;
-        if n == 0 {
-            break;
+    let mut frame_index = 0usize;
+
+    if reader.is_empty() {
+        return Err(zstd_malformed("zstd frame header is truncated"));
+    }
+
+    while !reader.is_empty() {
+        let magic = zstd_frame_magic(reader)?;
+        if is_zstd_skippable_magic(magic) {
+            reader = skip_zstd_frame(reader)?;
+            frame_index = frame_index.saturating_add(1);
+            continue;
         }
-        if out.len().saturating_add(n) > max {
-            return Err(SdJournalError::LimitExceeded {
-                kind: LimitKind::DecompressedBytes,
-                limit: u64::try_from(max).unwrap_or(u64::MAX),
+
+        let window_size = zstd_window_size(reader)?;
+        let window_limit = max.max(DEFAULT_WORKING_SET_LIMIT);
+        if window_size > u64::try_from(window_limit).unwrap_or(u64::MAX) {
+            return Err(SdJournalError::DecompressFailed {
+                algo: CompressionAlgo::Zstd,
+                reason: format!(
+                    "zstd frame {frame_index} window size {window_size} exceeds decoder working-set limit {window_limit}"
+                ),
             });
         }
-        out.extend_from_slice(&buf[..n]);
+
+        let input_len = reader.len();
+        {
+            let mut decoder = StreamingDecoder::new(&mut reader).map_err(|e| {
+                SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Zstd,
+                    reason: format!("zstd frame {frame_index}: {e}"),
+                }
+            })?;
+
+            loop {
+                let n = decoder
+                    .read(&mut buf)
+                    .map_err(|e| SdJournalError::DecompressFailed {
+                        algo: CompressionAlgo::Zstd,
+                        reason: format!("zstd frame {frame_index}: {e}"),
+                    })?;
+                if n == 0 {
+                    break;
+                }
+                if out.len().saturating_add(n) > max {
+                    return Err(SdJournalError::LimitExceeded {
+                        kind: LimitKind::DecompressedBytes,
+                        limit: u64::try_from(max).unwrap_or(u64::MAX),
+                    });
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+        }
+
+        if reader.len() >= input_len {
+            return Err(zstd_malformed("zstd decoder made no input progress"));
+        }
+        frame_index = frame_index.saturating_add(1);
     }
+
     Ok(out)
+}
+
+#[cfg(feature = "zstd")]
+fn zstd_window_size(src: &[u8]) -> Result<u64> {
+    const ZSTD_MAGIC: u32 = 0xfd2f_b528;
+
+    let magic = zstd_frame_magic(src)?;
+    if magic != ZSTD_MAGIC {
+        return Err(zstd_malformed("invalid zstd frame magic"));
+    }
+
+    let descriptor = *src
+        .get(4)
+        .ok_or_else(|| zstd_malformed("zstd frame descriptor is truncated"))?;
+    let single_segment = descriptor & 0x20 != 0;
+    let mut pos = 5usize;
+
+    let descriptor_window = if single_segment {
+        None
+    } else {
+        let window_descriptor = *src
+            .get(pos)
+            .ok_or_else(|| zstd_malformed("zstd window descriptor is truncated"))?;
+        pos = pos.saturating_add(1);
+        let exponent = u32::from(window_descriptor >> 3);
+        let mantissa = u64::from(window_descriptor & 0x07);
+        let window_base = 1u64
+            .checked_shl(10 + exponent)
+            .ok_or_else(|| zstd_malformed("zstd window size overflows u64"))?;
+        Some(window_base + (window_base / 8) * mantissa)
+    };
+
+    let dictionary_id_len = match descriptor & 0x03 {
+        0 => 0usize,
+        1 => 1,
+        2 => 2,
+        3 => 4,
+        _ => return Err(zstd_malformed("invalid zstd dictionary-id flag")),
+    };
+    pos = pos
+        .checked_add(dictionary_id_len)
+        .ok_or_else(|| zstd_malformed("zstd frame header size overflows"))?;
+    if pos > src.len() {
+        return Err(zstd_malformed("zstd dictionary id is truncated"));
+    }
+
+    let frame_content_size_len = match descriptor >> 6 {
+        0 if single_segment => 1usize,
+        0 => 0,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => return Err(zstd_malformed("invalid zstd content-size flag")),
+    };
+    let end = pos
+        .checked_add(frame_content_size_len)
+        .ok_or_else(|| zstd_malformed("zstd frame header size overflows"))?;
+    let frame_content_size_bytes = src
+        .get(pos..end)
+        .ok_or_else(|| zstd_malformed("zstd frame content size is truncated"))?;
+    let mut frame_content_size = 0u64;
+    for (shift, byte) in frame_content_size_bytes.iter().enumerate() {
+        frame_content_size |= u64::from(*byte) << (shift * 8);
+    }
+    if frame_content_size_len == 2 {
+        frame_content_size = frame_content_size.saturating_add(256);
+    }
+
+    Ok(descriptor_window.unwrap_or(frame_content_size))
+}
+
+#[cfg(feature = "zstd")]
+fn zstd_frame_magic(src: &[u8]) -> Result<u32> {
+    let bytes = src
+        .get(..4)
+        .ok_or_else(|| zstd_malformed("zstd frame header is truncated"))?;
+    let mut magic = [0u8; 4];
+    magic.copy_from_slice(bytes);
+    Ok(u32::from_le_bytes(magic))
+}
+
+#[cfg(feature = "zstd")]
+fn is_zstd_skippable_magic(magic: u32) -> bool {
+    (0x184d_2a50..=0x184d_2a5f).contains(&magic)
+}
+
+#[cfg(feature = "zstd")]
+fn skip_zstd_frame(src: &[u8]) -> Result<&[u8]> {
+    const SKIPPABLE_HEADER_SIZE: usize = 8;
+
+    let size_bytes = src
+        .get(4..SKIPPABLE_HEADER_SIZE)
+        .ok_or_else(|| zstd_malformed("zstd skippable frame header is truncated"))?;
+    let mut size = [0u8; 4];
+    size.copy_from_slice(size_bytes);
+    let payload_size = usize::try_from(u32::from_le_bytes(size))
+        .map_err(|_| zstd_malformed("zstd skippable frame size does not fit usize"))?;
+    let frame_size = SKIPPABLE_HEADER_SIZE
+        .checked_add(payload_size)
+        .ok_or_else(|| zstd_malformed("zstd skippable frame size overflows"))?;
+    src.get(frame_size..)
+        .ok_or_else(|| zstd_malformed("zstd skippable frame payload is truncated"))
+}
+
+#[cfg(feature = "zstd")]
+fn zstd_malformed(reason: &str) -> SdJournalError {
+    SdJournalError::DecompressFailed {
+        algo: CompressionAlgo::Zstd,
+        reason: reason.to_string(),
+    }
 }
 
 #[cfg(not(feature = "zstd"))]
@@ -85,10 +232,10 @@ pub(super) fn decompress_zstd(_src: &[u8], _max: usize) -> Result<Vec<u8>> {
 
 #[cfg(feature = "xz")]
 pub(super) fn decompress_xz(src: &[u8], max: usize) -> Result<Vec<u8>> {
-    use xz4rust::{DICT_SIZE_PROFILE_6, XzDecoder};
+    use xz4rust::{DICT_SIZE_MIN, DICT_SIZE_PROFILE_6, XzDecoder};
 
     let dict_limit = max.max(DICT_SIZE_PROFILE_6);
-    let mut decoder = XzDecoder::with_alloc_dict_size(DICT_SIZE_PROFILE_6, dict_limit);
+    let mut decoder = XzDecoder::with_alloc_dict_size(DICT_SIZE_MIN, dict_limit);
     let mut input_pos = 0usize;
     let mut out = Vec::new();
     let mut buf = [0u8; 16 * 1024];
@@ -128,7 +275,35 @@ pub(super) fn decompress_xz(src: &[u8], max: usize) -> Result<Vec<u8>> {
         out.extend_from_slice(&output[..produced]);
 
         if result.is_end_of_stream() {
-            return Ok(out);
+            if input_pos == src.len() {
+                return Ok(out);
+            }
+
+            let padding_start = input_pos;
+            while src.get(input_pos) == Some(&0) {
+                input_pos = input_pos.saturating_add(1);
+            }
+            let padding_len = input_pos.saturating_sub(padding_start);
+            if !padding_len.is_multiple_of(4) {
+                return Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Xz,
+                    reason: format!(
+                        "xz stream padding length is not a multiple of four: {padding_len}"
+                    ),
+                });
+            }
+            if input_pos == src.len() {
+                return Ok(out);
+            }
+            if !src[input_pos..].starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) {
+                return Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Xz,
+                    reason: "trailing bytes are not an xz stream".to_string(),
+                });
+            }
+
+            decoder.reset();
+            continue;
         }
         if !result.made_progress() {
             return Err(SdJournalError::DecompressFailed {
@@ -193,6 +368,121 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_decodes_concatenated_frames_and_skips_metadata_frames() {
+        let first = zstd_fixture(b"first");
+        let second = zstd_fixture(b"-second");
+        let mut encoded = first;
+        encoded.extend_from_slice(&zstd_skippable_fixture(b"metadata"));
+        encoded.extend_from_slice(&second);
+
+        assert_eq!(decompress_zstd(&encoded, 64).unwrap(), b"first-second");
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_checks_the_window_limit_of_every_frame() {
+        let mut encoded = zstd_fixture(b"first");
+        // Standard magic, non-single-segment frame, and a 16 MiB window descriptor.
+        encoded.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd, 0x00, 14 << 3]);
+
+        match decompress_zstd(&encoded, 128) {
+            Err(SdJournalError::DecompressFailed { algo, reason }) => {
+                assert_eq!(algo, CompressionAlgo::Zstd);
+                assert!(reason.contains("frame 1 window size"), "{reason}");
+                assert!(reason.contains("working-set limit"), "{reason}");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_rejects_truncated_later_frames_and_skippable_frames() {
+        let mut truncated_frame = zstd_fixture(b"first");
+        let mut second_frame = zstd_fixture(b"second");
+        second_frame.pop();
+        truncated_frame.extend_from_slice(&second_frame);
+        assert!(matches!(
+            decompress_zstd(&truncated_frame, 128),
+            Err(SdJournalError::DecompressFailed {
+                algo: CompressionAlgo::Zstd,
+                ..
+            })
+        ));
+
+        let mut truncated_skippable = zstd_fixture(b"first");
+        truncated_skippable.extend_from_slice(&0x184d_2a50u32.to_le_bytes());
+        truncated_skippable.extend_from_slice(&5u32.to_le_bytes());
+        truncated_skippable.extend_from_slice(b"tiny");
+        match decompress_zstd(&truncated_skippable, 128) {
+            Err(SdJournalError::DecompressFailed { algo, reason }) => {
+                assert_eq!(algo, CompressionAlgo::Zstd);
+                assert!(reason.contains("skippable frame payload is truncated"));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_applies_the_output_limit_across_frames() {
+        let mut encoded = zstd_fixture(b"first");
+        encoded.extend_from_slice(&zstd_fixture(b"-second"));
+
+        match decompress_zstd(&encoded, 11) {
+            Err(SdJournalError::LimitExceeded { kind, limit }) => {
+                assert_eq!(kind, LimitKind::DecompressedBytes);
+                assert_eq!(limit, 11);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_rejects_trailing_garbage_after_a_valid_frame() {
+        let mut encoded = zstd_fixture(b"valid");
+        encoded.extend_from_slice(b"garbage");
+
+        match decompress_zstd(&encoded, 128) {
+            Err(SdJournalError::DecompressFailed { algo, reason }) => {
+                assert_eq!(algo, CompressionAlgo::Zstd);
+                assert_eq!(reason, "invalid zstd frame magic");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_rejects_oversized_window_before_decoder_allocation() {
+        // Standard magic, non-single-segment frame, and a 16 MiB window descriptor.
+        let encoded = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 14 << 3];
+        match decompress_zstd(&encoded, 128) {
+            Err(SdJournalError::DecompressFailed { algo, reason }) => {
+                assert_eq!(algo, CompressionAlgo::Zstd);
+                assert!(reason.contains("working-set limit"), "{reason}");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    fn zstd_fixture(plain: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(plain, ruzstd::encoding::CompressionLevel::Uncompressed)
+    }
+
+    #[cfg(feature = "zstd")]
+    fn zstd_skippable_fixture(payload: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&0x184d_2a50u32.to_le_bytes());
+        encoded.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(payload);
+        encoded
+    }
+
     #[cfg(feature = "xz")]
     #[test]
     fn xz_roundtrip_and_limit_checks() {
@@ -216,6 +506,44 @@ mod tests {
         match decompress_xz(b"not xz", 128) {
             Err(SdJournalError::DecompressFailed { algo, .. }) => {
                 assert_eq!(algo, CompressionAlgo::Xz);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn xz_decodes_concatenated_streams_and_stream_padding() {
+        let plain = b"hello from xz";
+        let mut encoded = xz_fixture().to_vec();
+        encoded.extend_from_slice(&[0; 4]);
+        encoded.extend_from_slice(xz_fixture());
+        encoded.extend_from_slice(&[0; 8]);
+
+        let mut expected = plain.to_vec();
+        expected.extend_from_slice(plain);
+        assert_eq!(decompress_xz(&encoded, expected.len()).unwrap(), expected);
+    }
+
+    #[cfg(feature = "xz")]
+    #[test]
+    fn xz_rejects_trailing_garbage_and_invalid_stream_padding() {
+        let mut garbage = xz_fixture().to_vec();
+        garbage.extend_from_slice(b"garbage");
+        match decompress_xz(&garbage, 128) {
+            Err(SdJournalError::DecompressFailed { algo, reason }) => {
+                assert_eq!(algo, CompressionAlgo::Xz);
+                assert_eq!(reason, "trailing bytes are not an xz stream");
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        let mut padding = xz_fixture().to_vec();
+        padding.push(0);
+        match decompress_xz(&padding, 128) {
+            Err(SdJournalError::DecompressFailed { algo, reason }) => {
+                assert_eq!(algo, CompressionAlgo::Xz);
+                assert!(reason.contains("padding length is not a multiple of four"));
             }
             other => panic!("unexpected result: {other:?}"),
         }

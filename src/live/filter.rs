@@ -12,6 +12,8 @@ pub(super) enum MatchTerm {
 #[derive(Debug, Clone)]
 pub(super) struct CompiledFilter {
     pub(super) branches: Vec<Vec<MatchTerm>>,
+    pub(super) global_terms: Vec<MatchTerm>,
+    pub(super) or_groups: Vec<Vec<MatchTerm>>,
 }
 
 impl CompiledFilter {
@@ -87,7 +89,7 @@ impl LiveFilter {
             return self;
         }
         if let Err(e) = validate_field_name(field, &self.config) {
-            self.invalid_reason = Some(e.to_string());
+            self.invalid_reason = Some(invalid_query_reason(e));
             return self;
         }
         if self.count_terms() >= self.config.max_query_terms {
@@ -112,7 +114,7 @@ impl LiveFilter {
             return self;
         }
         if let Err(e) = validate_field_name(field, &self.config) {
-            self.invalid_reason = Some(e.to_string());
+            self.invalid_reason = Some(invalid_query_reason(e));
             return self;
         }
         if self.count_terms() >= self.config.max_query_terms {
@@ -243,6 +245,8 @@ impl LiveFilter {
         self.validate()?;
         Ok(CompiledFilter {
             branches: build_branches(self),
+            global_terms: self.global_terms.clone(),
+            or_groups: self.or_groups.clone(),
         })
     }
 
@@ -288,7 +292,7 @@ impl LiveOrGroupBuilder {
             return self;
         }
         if let Err(e) = validate_field_name(field, &self.config) {
-            self.invalid_reason = Some(e.to_string());
+            self.invalid_reason = Some(invalid_query_reason(e));
             return self;
         }
         if self.terms.len() >= self.remaining {
@@ -309,7 +313,7 @@ impl LiveOrGroupBuilder {
             return self;
         }
         if let Err(e) = validate_field_name(field, &self.config) {
-            self.invalid_reason = Some(e.to_string());
+            self.invalid_reason = Some(invalid_query_reason(e));
             return self;
         }
         if self.terms.len() >= self.remaining {
@@ -325,6 +329,11 @@ impl LiveOrGroupBuilder {
 }
 
 fn validate_field_name(field: &str, config: &JournalConfig) -> Result<()> {
+    if field.is_empty() {
+        return Err(SdJournalError::InvalidQuery {
+            reason: "field name must not be empty".to_string(),
+        });
+    }
     if field.len() > config.max_field_name_len {
         return Err(SdJournalError::InvalidQuery {
             reason: "field name too long".to_string(),
@@ -336,6 +345,13 @@ fn validate_field_name(field: &str, config: &JournalConfig) -> Result<()> {
         });
     }
     Ok(())
+}
+
+fn invalid_query_reason(error: SdJournalError) -> String {
+    match error {
+        SdJournalError::InvalidQuery { reason } => reason,
+        other => other.to_string(),
+    }
 }
 
 fn build_branches(filter: &LiveFilter) -> Vec<Vec<MatchTerm>> {
@@ -365,12 +381,16 @@ mod tests {
 
     fn sample_entry() -> EntryOwned {
         EntryOwned::new(
-            [0x11; 16],
-            7,
-            9,
-            11,
-            13,
-            [0x22; 16],
+            crate::cursor::SdJournalEntryKey {
+                file_id: [0x11; 16],
+                entry_offset: 7,
+                seqnum_id: [0x12; 16],
+                seqnum: 9,
+                realtime_usec: 11,
+                monotonic_usec: 13,
+                boot_id: [0x22; 16],
+                xor_hash: 15,
+            },
             vec![
                 ("MESSAGE".to_string(), b"hello".to_vec()),
                 ("_SYSTEMD_UNIT".to_string(), b"sshd.service".to_vec()),
@@ -386,6 +406,17 @@ mod tests {
         let compiled = filter.compile().expect("filter should compile");
 
         assert!(compiled.matches(&sample_entry()));
+    }
+
+    #[test]
+    fn live_filter_rejects_an_empty_field_name() {
+        let mut filter = LiveFilter::new(JournalConfig::default());
+        filter.match_present("");
+        assert!(matches!(
+            filter.compile(),
+            Err(SdJournalError::InvalidQuery { reason })
+                if reason.contains("field name must not be empty")
+        ));
     }
 
     #[test]
