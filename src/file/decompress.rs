@@ -26,12 +26,22 @@ pub(super) fn decompress_lz4(src: &[u8], max: usize) -> Result<Vec<u8>> {
     crate::util::ensure_limit_usize(LimitKind::DecompressedBytes, max, size_usize)?;
 
     let compressed = &src[8..];
-    lz4_flex::block::decompress(compressed, size_usize).map_err(|e| {
+    let output = lz4_flex::block::decompress(compressed, size_usize).map_err(|e| {
         SdJournalError::DecompressFailed {
             algo: CompressionAlgo::Lz4,
             reason: e.to_string(),
         }
-    })
+    })?;
+    if output.len() != size_usize {
+        return Err(SdJournalError::DecompressFailed {
+            algo: CompressionAlgo::Lz4,
+            reason: format!(
+                "lz4 output length {} differs from advertised size {size_usize}",
+                output.len()
+            ),
+        });
+    }
+    Ok(output)
 }
 
 #[cfg(not(feature = "lz4"))]
@@ -64,7 +74,7 @@ pub(super) fn decompress_zstd(src: &[u8], max: usize) -> Result<Vec<u8>> {
             continue;
         }
 
-        let window_size = zstd_window_size(reader)?;
+        let (window_size, content_size) = zstd_frame_sizes(reader)?;
         let window_limit = max.max(DEFAULT_WORKING_SET_LIMIT);
         if window_size > u64::try_from(window_limit).unwrap_or(u64::MAX) {
             return Err(SdJournalError::DecompressFailed {
@@ -76,6 +86,7 @@ pub(super) fn decompress_zstd(src: &[u8], max: usize) -> Result<Vec<u8>> {
         }
 
         let input_len = reader.len();
+        let frame_output_start = out.len();
         {
             let mut decoder = StreamingDecoder::new(&mut reader).map_err(|e| {
                 SdJournalError::DecompressFailed {
@@ -102,6 +113,29 @@ pub(super) fn decompress_zstd(src: &[u8], max: usize) -> Result<Vec<u8>> {
                 }
                 out.extend_from_slice(&buf[..n]);
             }
+
+            // StreamingDecoder exposes these values but does not compare them. Check only
+            // after draining the frame, when its calculated checksum includes all output.
+            if let Some(expected) = decoder.decoder.get_checksum_from_data()
+                && decoder.decoder.get_calculated_checksum() != Some(expected)
+            {
+                return Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Zstd,
+                    reason: format!("zstd frame {frame_index} content checksum mismatch"),
+                });
+            }
+        }
+
+        if let Some(expected) = content_size {
+            let produced = out.len() - frame_output_start;
+            if u64::try_from(produced).unwrap_or(u64::MAX) != expected {
+                return Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Zstd,
+                    reason: format!(
+                        "zstd frame {frame_index} output length {produced} differs from advertised size {expected}"
+                    ),
+                });
+            }
         }
 
         if reader.len() >= input_len {
@@ -114,7 +148,7 @@ pub(super) fn decompress_zstd(src: &[u8], max: usize) -> Result<Vec<u8>> {
 }
 
 #[cfg(feature = "zstd")]
-fn zstd_window_size(src: &[u8]) -> Result<u64> {
+fn zstd_frame_sizes(src: &[u8]) -> Result<(u64, Option<u64>)> {
     const ZSTD_MAGIC: u32 = 0xfd2f_b528;
 
     let magic = zstd_frame_magic(src)?;
@@ -179,7 +213,10 @@ fn zstd_window_size(src: &[u8]) -> Result<u64> {
         frame_content_size = frame_content_size.saturating_add(256);
     }
 
-    Ok(descriptor_window.unwrap_or(frame_content_size))
+    Ok((
+        descriptor_window.unwrap_or(frame_content_size),
+        (frame_content_size_len != 0).then_some(frame_content_size),
+    ))
 }
 
 #[cfg(feature = "zstd")]
@@ -357,6 +394,21 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn lz4_rejects_a_block_shorter_than_its_advertised_size() {
+        let plain = b"MESSAGE=truncated";
+        let mut encoded = ((plain.len() + 1) as u64).to_le_bytes().to_vec();
+        encoded.extend_from_slice(&lz4_flex::block::compress(plain));
+        assert!(matches!(
+            decompress_lz4(&encoded, 128),
+            Err(SdJournalError::DecompressFailed {
+                algo: CompressionAlgo::Lz4,
+                ..
+            })
+        ));
+    }
+
     #[cfg(feature = "zstd")]
     #[test]
     fn zstd_rejects_invalid_payload() {
@@ -366,6 +418,69 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_rejects_invalid_checksums_in_every_frame() {
+        let plain = b"MESSAGE=checksummed";
+        let valid = zstd_fixture(plain);
+        assert_ne!(valid[4] & 4, 0, "fixture must include a content checksum");
+        assert_eq!(decompress_zstd(&valid, 128).unwrap(), plain);
+
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        for prefix in [Vec::new(), valid] {
+            let mut encoded = prefix;
+            encoded.extend_from_slice(&corrupt);
+            assert!(matches!(
+                decompress_zstd(&encoded, 128),
+                Err(SdJournalError::DecompressFailed {
+                    algo: CompressionAlgo::Zstd,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_validates_declared_content_size_for_every_frame() {
+        for prefix in [Vec::new(), zstd_fixture(b"first")] {
+            for declared_size in [0, 4, 6] {
+                let mut encoded = prefix.clone();
+                // A single-segment frame declaring a different size from its five-byte raw block.
+                encoded.extend_from_slice(&[
+                    0x28,
+                    0xb5,
+                    0x2f,
+                    0xfd,
+                    0x20,
+                    declared_size,
+                    0x29,
+                    0,
+                    0,
+                ]);
+                encoded.extend_from_slice(b"hello");
+                assert!(
+                    matches!(
+                        decompress_zstd(&encoded, 128),
+                        Err(SdJournalError::DecompressFailed {
+                            algo: CompressionAlgo::Zstd,
+                            ..
+                        })
+                    ),
+                    "accepted invalid declared size {declared_size}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_accepts_a_frame_with_an_explicit_zero_content_size() {
+        let encoded = [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0, 1, 0, 0];
+        assert!(decompress_zstd(&encoded, 0).unwrap().is_empty());
     }
 
     #[cfg(feature = "zstd")]

@@ -3,7 +3,7 @@ use crate::cursor::{
     LegacyEntryKey, SdJournalEntryKey, SystemdCursor, compare_entry_keys, same_entry,
 };
 use crate::error::{Result, SdJournalError};
-use crate::file::EntryMeta;
+use crate::file::{EntryMeta, JournalFile};
 use std::cmp::Ordering;
 
 #[derive(Debug, Clone)]
@@ -153,11 +153,26 @@ fn resolve_full_key(query: &JournalQuery, key: &SdJournalEntryKey) -> Result<Opt
         }
 
         let file = query.journal.inner.open_file_by_index(index)?;
-        let meta = file.read_entry_meta(key.entry_offset)?;
-        return Ok(same_entry(&entry_key_from_meta(&meta), key).then_some(meta));
+        if let Some(meta) = committed_meta_at_offset(&file, key.entry_offset)?
+            && same_entry(&entry_key_from_meta(&meta), key)
+        {
+            return Ok(Some(meta));
+        }
     }
 
-    Ok(None)
+    // A logical entry can survive rotation or vacuuming in a different journal file. Use the
+    // same fallback identity as a serialized cursor, which intentionally omits physical location.
+    find_exact_systemd_cursor(
+        query,
+        &SystemdCursor {
+            seqnum_id: Some(key.seqnum_id),
+            seqnum: Some(key.seqnum),
+            boot_id: Some(key.boot_id),
+            monotonic_usec: Some(key.monotonic_usec),
+            realtime_usec: Some(key.realtime_usec),
+            xor_hash: Some(key.xor_hash),
+        },
+    )
 }
 
 fn resolve_file_offset(
@@ -174,10 +189,22 @@ fn resolve_file_offset(
         }
 
         let file = query.journal.inner.open_file_by_index(index)?;
-        return file.read_entry_meta(entry_offset);
+        return committed_meta_at_offset(&file, entry_offset)?.ok_or(SdJournalError::NotFound);
     }
 
     Err(SdJournalError::NotFound)
+}
+
+fn committed_meta_at_offset(file: &JournalFile, entry_offset: u64) -> Result<Option<EntryMeta>> {
+    // A syntactically valid ENTRY may have been prewritten before n_entries was committed, or
+    // may not belong to the file-level ENTRY array at all. Cursors must not inject such objects
+    // into a query. Seek in the validated, snapshotted array instead of reading the offset raw.
+    let mut entries =
+        file.entry_iter_after_offset(false, entry_offset.saturating_sub(1), None, None)?;
+    match entries.next().transpose()? {
+        Some(meta) if meta.entry_offset == entry_offset => Ok(Some(meta)),
+        _ => Ok(None),
+    }
 }
 
 fn compare_legacy(meta: &EntryMeta, key: &LegacyEntryKey) -> Ordering {

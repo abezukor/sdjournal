@@ -129,6 +129,19 @@ impl ReopenAccess {
     }
 
     pub(crate) fn read_known_valid(&self, offset: u64, len: usize) -> Result<ByteBuf> {
+        let file = self.open_validated()?;
+        let mut buf = vec![0u8; len];
+        if let Err(error) = read_exact_at(&file, offset, &mut buf) {
+            return Err(read_failure(&self.path, offset, len, error));
+        }
+        Ok(ByteBuf::from_vec(buf))
+    }
+
+    pub(crate) fn validate_identity(&self) -> Result<()> {
+        self.open_validated().map(drop)
+    }
+
+    fn open_validated(&self) -> Result<File> {
         let file = File::open(&self.path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::PermissionDenied {
                 SdJournalError::PermissionDenied {
@@ -154,11 +167,7 @@ impl ReopenAccess {
             });
         }
 
-        let mut buf = vec![0u8; len];
-        if let Err(error) = read_exact_at(&file, offset, &mut buf) {
-            return Err(read_failure(&self.path, offset, len, error));
-        }
-        Ok(ByteBuf::from_vec(buf))
+        Ok(file)
     }
 }
 
@@ -236,27 +245,20 @@ impl MmapAccess {
 }
 
 #[cfg(unix)]
-fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
+fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt as _;
-    while !buf.is_empty() {
-        let n = file.read_at(buf, offset)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "unexpected EOF",
-            ));
-        }
-        offset = offset.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
-        buf = &mut buf[n..];
-    }
-    Ok(())
+    // The standard exact-read loop retries Interrupted without losing partial progress.
+    file.read_exact_at(buf, offset)
 }
 
 #[cfg(windows)]
 fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt as _;
     while !buf.is_empty() {
-        let n = file.seek_read(buf, offset)?;
+        let n = match file.seek_read(buf, offset) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,

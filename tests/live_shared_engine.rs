@@ -259,6 +259,53 @@ fn topology_refresh_keeps_older_append_from_another_stream() {
 }
 
 #[test]
+fn topology_refresh_retries_corrupt_payload_without_blocking_healthy_files() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let healthy = layout.root().join("healthy.journal");
+    write_synthetic_journal_file(&healthy, &["beta.service"], 9);
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), live_test_config())
+        .expect("open two healthy journals");
+    let alpha = subscribe_unit(&mut live, "alpha.service");
+    let beta = subscribe_unit(&mut live, "beta.service");
+    assert_eq!(live.poll_once().expect("clear initial recheck"), 0);
+
+    layout.rewrite(&["alpha.service", "alpha.service"]);
+    let damaged = layout.root().join("synthetic.journal");
+    let valid = fs::read(&damaged).expect("read valid append");
+    let mut bytes = valid.clone();
+    let array = u64::from_le_bytes(bytes[176..184].try_into().expect("array offset")) as usize;
+    let entry = u64::from_le_bytes(
+        bytes[array + 32..array + 40]
+            .try_into()
+            .expect("second entry"),
+    ) as usize;
+    let data = u64::from_le_bytes(
+        bytes[entry + 64..entry + 72]
+            .try_into()
+            .expect("DATA offset"),
+    ) as usize;
+    bytes[data] = 0;
+    fs::write(&damaged, bytes).expect("invalidate appended DATA object only");
+    write_synthetic_journal_file(&healthy, &["beta.service", "beta.service"], 9);
+    fs::write(layout.root().join("topology-trigger"), []).expect("force topology refresh");
+
+    assert_eq!(poll_until_delivered(&mut live, 1), 1);
+    assert_eq!(
+        field(&recv_ready(&beta), "MESSAGE"),
+        synthetic_message(9, 1, "beta.service")
+    );
+    assert_subscription_empty(&alpha);
+
+    fs::write(&damaged, valid).expect("repair appended DATA object");
+    assert_eq!(poll_until_delivered(&mut live, 1), 1);
+    assert_eq!(
+        field(&recv_ready(&alpha), "MESSAGE"),
+        synthetic_message(7, 1, "alpha.service")
+    );
+    assert_subscription_empty(&beta);
+}
+
+#[test]
 fn live_engine_survives_temporarily_empty_topology() {
     let layout = SyntheticJournalFile::new(&["alpha.service"]);
     let mut live = LiveJournal::open_dir_with_config(layout.root(), live_test_config())
@@ -326,6 +373,38 @@ fn live_engine_waits_for_header_commit_before_consuming_entry_array_slot() {
         &synthetic_message(7, 1, "alpha.service"),
     );
     assert_subscription_empty(&alpha);
+}
+
+#[test]
+fn live_engine_does_not_skip_a_zero_committed_slot_to_consume_a_future_entry() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), live_test_config())
+        .expect("open live engine");
+    let alpha = subscribe_unit(&mut live, "alpha.service");
+    assert_eq!(live.poll_once().expect("clear initial recheck"), 0);
+
+    layout.rewrite(&["alpha.service", "alpha.service", "alpha.service"]);
+    let path = layout.root().join("synthetic.journal");
+    let valid = fs::read(&path).expect("read complete append");
+    let mut incomplete = valid.clone();
+    let array = u64::from_le_bytes(incomplete[176..184].try_into().expect("array offset")) as usize;
+    incomplete[152..160].copy_from_slice(&2u64.to_le_bytes());
+    incomplete[array + 32..array + 40].fill(0);
+    fs::write(&path, incomplete).expect("leave a missing committed slot before a future slot");
+
+    assert_eq!(live.poll_once().expect("retry incomplete ENTRY_ARRAY"), 0);
+    assert_subscription_empty(&alpha);
+
+    fs::write(&path, valid).expect("finish both appended entries");
+    assert_eq!(poll_until_delivered(&mut live, 2), 2);
+    assert_eq!(
+        field(&recv_ready(&alpha), "MESSAGE"),
+        synthetic_message(7, 1, "alpha.service")
+    );
+    assert_eq!(
+        field(&recv_ready(&alpha), "MESSAGE"),
+        synthetic_message(7, 2, "alpha.service")
+    );
 }
 
 #[test]
@@ -497,6 +576,79 @@ fn replay_snapshot_append_is_not_repeated_by_the_older_live_tail() {
 }
 
 #[test]
+fn replay_deduplicates_rotated_logical_copies_with_new_file_ids() {
+    for (historical_count, copied_count) in [(2, 2), (6, 1)] {
+        let layout = SyntheticJournalFile::new(&vec!["alpha.service"; historical_count]);
+        let mut config = live_test_config_with_live_limits(1, 1, LiveQueueFullPolicy::Block);
+        // The replay identity window is three entries. The second case checks that an early
+        // deferred copy is removed even when historical replay outlives that window.
+        config.max_journal_files = 2;
+        let mut live =
+            LiveJournal::open_dir_with_config(layout.root(), config).expect("open replay engine");
+        let keeper = subscribe_unit(&mut live, "absent.service");
+        assert_eq!(live.poll_once().expect("clear initial recheck"), 0);
+        let mut options = SubscriptionOptions::new(live.filter());
+        options.since_realtime(0);
+        let replay = live
+            .subscribe_with_options(options)
+            .expect("subscribe replay");
+
+        let copy = layout.root().join("rotated.journal");
+        write_synthetic_journal_file(&copy, &vec!["alpha.service"; copied_count], 7);
+        rewrite_file_id(&copy, 0xa7);
+
+        let mut messages = Vec::new();
+        for _ in 0..20 {
+            live.poll_once()
+                .expect("drain replay and rotated logical copies");
+            drain_ready_messages(&replay, &mut messages);
+        }
+        let expected: Vec<_> = (0..historical_count)
+            .map(|index| synthetic_message(7, index, "alpha.service"))
+            .collect();
+        assert_eq!(
+            messages, expected,
+            "a snapshot entry copied into a new file during replay must not be delivered twice"
+        );
+        assert_subscription_empty(&keeper);
+    }
+}
+
+#[test]
+fn active_replay_checks_late_copies_after_recent_identity_eviction() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"; 6]);
+    let mut config = live_test_config_with_live_limits(4, 1, LiveQueueFullPolicy::Block);
+    config.max_journal_files = 2;
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), config).expect("open replay");
+    let mut options = SubscriptionOptions::new(live.filter());
+    options.since_realtime(0);
+    let replay = live
+        .subscribe_with_options(options)
+        .expect("subscribe replay");
+    let mut messages = Vec::new();
+    for _ in 0..5 {
+        assert_eq!(
+            live.poll_once().expect("replay through identity eviction"),
+            1
+        );
+        drain_ready_messages(&replay, &mut messages);
+    }
+
+    let copy = layout.root().join("late-copy.journal");
+    write_synthetic_journal_file(&copy, &["alpha.service"], 7);
+    rewrite_file_id(&copy, 0xa7);
+    for _ in 0..10 {
+        live.poll_once()
+            .expect("finish replay with late historical copy");
+        drain_ready_messages(&replay, &mut messages);
+    }
+    let expected: Vec<_> = (0..6)
+        .map(|index| synthetic_message(7, index, "alpha.service"))
+        .collect();
+    assert_eq!(messages, expected);
+}
+
+#[test]
 fn replay_snapshot_switches_to_live_entries_created_after_subscription() {
     let layout = SyntheticJournalFile::new(&["alpha.service", "alpha.service"]);
     let mut cfg = live_test_config_with_live_limits(4, 1, LiveQueueFullPolicy::Block);
@@ -604,6 +756,106 @@ fn replay_buffers_post_subscription_entries_across_file_removal() {
         ]
     );
     assert_subscription_empty(&keeper);
+}
+
+#[test]
+fn replay_continues_when_the_previous_batch_cursor_file_is_removed() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    write_synthetic_journal_file(
+        &layout.root().join("later.journal"),
+        &["alpha.service", "alpha.service"],
+        9,
+    );
+    let mut live = LiveJournal::open_dir_with_config(
+        layout.root(),
+        live_test_config_with_live_limits(4, 1, LiveQueueFullPolicy::Block),
+    )
+    .expect("open replay engine");
+    let mut filter = live.filter();
+    filter.match_unit("alpha.service");
+    let mut options = SubscriptionOptions::new(filter);
+    options.since_realtime(0);
+    let alpha = live
+        .subscribe_with_options(options)
+        .expect("subscribe replay");
+
+    assert_eq!(live.poll_once().expect("first replay batch"), 1);
+    assert_eq!(
+        field(&recv_ready(&alpha), "MESSAGE"),
+        synthetic_message(7, 0, "alpha.service")
+    );
+    fs::remove_file(layout.root().join("synthetic.journal"))
+        .expect("vacuum the already replayed file");
+
+    let mut messages = Vec::new();
+    for _ in 0..8 {
+        live.poll_once()
+            .expect("continue replay from healthy files");
+        drain_ready_messages(&alpha, &mut messages);
+        if messages.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        messages,
+        [
+            synthetic_message(9, 0, "alpha.service"),
+            synthetic_message(9, 1, "alpha.service"),
+        ]
+    );
+}
+
+#[test]
+fn replay_retains_collected_entries_when_a_later_entry_returns_a_hard_error() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let middle = layout.root().join("middle.journal");
+    let later = layout.root().join("later.journal");
+    write_synthetic_journal_file(&middle, &["alpha.service"], 9);
+    write_synthetic_journal_file(&later, &["alpha.service"], 11);
+    // Only the middle file exceeds the configured field count. The other files remain valid
+    // after omitting their optional final SYSLOG_IDENTIFIER field from the ENTRY item list.
+    for path in [layout.root().join("synthetic.journal"), later] {
+        let mut bytes = fs::read(&path).expect("read synthetic journal");
+        let entry = u64::from_le_bytes(bytes[136..144].try_into().expect("tail offset")) as usize;
+        bytes[entry + 8..entry + 16].copy_from_slice(&144u64.to_le_bytes());
+        fs::write(path, bytes).expect("omit final ENTRY field");
+    }
+    let mut cfg = live_test_config_with_live_limits(4, 1, LiveQueueFullPolicy::Block);
+    cfg.max_fields_per_entry = 5;
+    let mut live = LiveJournal::open_dir_with_config(layout.root(), cfg).expect("open live engine");
+    let mut options = SubscriptionOptions::new(live.filter());
+    options.since_realtime(0);
+    let alpha = live
+        .subscribe_with_options(options)
+        .expect("subscribe replay");
+
+    assert!(matches!(
+        live.poll_once(),
+        Err(sdjournal::SdJournalError::LimitExceeded {
+            kind: sdjournal::LimitKind::FieldsPerEntry,
+            limit: 5,
+        })
+    ));
+    assert_subscription_empty(&alpha);
+    fs::remove_file(layout.root().join("synthetic.journal"))
+        .expect("remove the source of the entry collected before the error");
+
+    let mut messages = Vec::new();
+    for _ in 0..8 {
+        live.poll_once()
+            .expect("resume after the reported replay error");
+        drain_ready_messages(&alpha, &mut messages);
+        if messages.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        messages,
+        [
+            synthetic_message(7, 0, "alpha.service"),
+            synthetic_message(11, 0, "alpha.service"),
+        ]
+    );
 }
 
 #[test]
@@ -1032,7 +1284,8 @@ fn write_corrupt_tilde_journal(root: &Path) {
     let mut bytes = fs::read(root.join("synthetic.journal")).expect("read synthetic journal");
 
     bytes[24] = bytes[24].wrapping_add(101);
-    bytes[288] = 0;
+    let array = u64::from_le_bytes(bytes[176..184].try_into().expect("entry array offset"));
+    bytes[usize::try_from(array).expect("entry array offset fits")] = 0;
 
     fs::write(root.join("corrupt.journal~"), bytes).expect("write corrupt tilde journal");
 }

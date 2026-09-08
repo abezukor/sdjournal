@@ -4,6 +4,7 @@ use crate::error::{LimitKind, Result, SdJournalError};
 use crate::format::{OBJECT_ENTRY_ARRAY, ObjectHeader, STATE_ONLINE};
 use crate::util::{read_u32_le, read_u64_le};
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 const ENTRY_ARRAY_CHUNK_BYTES: usize = 4096;
 
@@ -14,6 +15,29 @@ struct EntryArrayDescriptor {
     used_items: usize,
     first: u64,
     last: u64,
+}
+
+pub(super) struct EntryIndex {
+    arrays: Vec<EntryArrayDescriptor>,
+}
+
+impl EntryIndex {
+    fn contains(&self, file: &JournalFile, entry_offset: u64) -> Result<bool> {
+        let array_index = self
+            .arrays
+            .partition_point(|array| array.last < entry_offset);
+        let Some(array) = self.arrays.get(array_index) else {
+            return Ok(false);
+        };
+        if entry_offset < array.first {
+            return Ok(false);
+        }
+        let item_index = partition_entry_array(file, array, entry_offset, true)?;
+        if item_index == array.used_items {
+            return Ok(false);
+        }
+        Ok(read_entry_array_item(file, array.offset, &array.layout, item_index)? == entry_offset)
+    }
 }
 
 struct EntryArrayCursor {
@@ -202,6 +226,7 @@ pub(crate) struct DataEntryOffsetIter {
     first_entry_offset: u64,
     first_pending: bool,
     arrays: EntryArrayCursor,
+    entry_index: Arc<EntryIndex>,
     exhausted: bool,
 }
 
@@ -217,6 +242,7 @@ impl DataEntryOffsetIter {
         after_entry_offset: Option<u64>,
     ) -> Result<Self> {
         validate_data_entry_metadata(&file, data)?;
+        let entry_index = file.committed_entry_index()?;
         let descriptors = collect_entry_array_descriptors(
             &file,
             data.entry_array_offset,
@@ -247,6 +273,7 @@ impl DataEntryOffsetIter {
             first_entry_offset: data.entry_offset,
             first_pending,
             arrays,
+            entry_index,
             exhausted: false,
         };
 
@@ -260,6 +287,24 @@ impl DataEntryOffsetIter {
         }
 
         Ok(iter)
+    }
+
+    fn checked_entry_offset(&mut self, offset: u64) -> Result<u64> {
+        let result = self.entry_index.contains(&self.arrays.file, offset);
+        match result {
+            Ok(true) => Ok(offset),
+            Ok(false) => {
+                self.exhausted = true;
+                Err(self.arrays.file.metadata_error(
+                    Some(offset),
+                    "DATA index references an ENTRY outside the committed file-level ENTRY_ARRAY",
+                ))
+            }
+            Err(error) => {
+                self.exhausted = true;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -275,7 +320,7 @@ impl Iterator for DataEntryOffsetIter {
             self.first_pending = false;
             if self.first_entry_offset != 0 {
                 self.arrays.previous_offset = Some(self.first_entry_offset);
-                return Some(Ok(self.first_entry_offset));
+                return Some(self.checked_entry_offset(self.first_entry_offset));
             }
         }
 
@@ -283,7 +328,7 @@ impl Iterator for DataEntryOffsetIter {
             if offset.is_err() {
                 self.exhausted = true;
             }
-            return Some(offset);
+            return Some(offset.and_then(|offset| self.checked_entry_offset(offset)));
         }
 
         if self.reverse && self.first_pending {
@@ -301,7 +346,7 @@ impl Iterator for DataEntryOffsetIter {
                         ),
                     )));
                 }
-                return Some(Ok(self.first_entry_offset));
+                return Some(self.checked_entry_offset(self.first_entry_offset));
             }
         }
 
@@ -384,6 +429,79 @@ impl FileEntryIter {
 }
 
 impl JournalFile {
+    fn committed_entry_index(&self) -> Result<Arc<EntryIndex>> {
+        if let Some(index) = self.inner.entry_index.get() {
+            return Ok(Arc::clone(index));
+        }
+        self.validate_entry_index_metadata()?;
+        // Keep only per-array descriptors, not every entry offset. This validation is shared
+        // across DATA postings and queries of the same snapshot; failed reads are not cached.
+        let arrays = collect_entry_array_descriptors(
+            self,
+            self.inner.header.entry_array_offset,
+            self.inner.header.n_entries,
+            false,
+        )?;
+        let index = Arc::new(EntryIndex { arrays });
+        let _ = self.inner.entry_index.set(Arc::clone(&index));
+        Ok(self
+            .inner
+            .entry_index
+            .get()
+            .map(Arc::clone)
+            .unwrap_or(index))
+    }
+
+    pub(super) fn snapshot_entry_range(&self) -> Result<EntryRange> {
+        // ENTRY_ARRAY slots and header tail hints are updated separately from n_entries.
+        // Locate the snapshotted ordinal, without reading later slots or trusting a tail hint
+        // that may still describe the previous append. Only array headers need to be traversed.
+        let mut current = self.inner.header.entry_array_offset;
+        let mut remaining = self.inner.header.n_entries;
+        let mut first = None;
+        let mut steps = 0usize;
+        while current != 0 && remaining != 0 {
+            if steps >= self.inner.config.max_object_chain_steps {
+                return Err(SdJournalError::LimitExceeded {
+                    kind: LimitKind::ObjectChainSteps,
+                    limit: u64::try_from(self.inner.config.max_object_chain_steps)
+                        .unwrap_or(u64::MAX),
+                });
+            }
+            steps += 1;
+            let layout = read_entry_array_layout(self, current)?;
+            if first.is_none() {
+                let offset = read_entry_array_item(self, current, &layout, 0)?;
+                first = Some(self.read_entry_meta(offset)?);
+            }
+            let count = u64::try_from(layout.item_count).unwrap_or(u64::MAX);
+            if remaining <= count {
+                let index = usize::try_from(remaining - 1).map_err(|_| {
+                    self.metadata_error(Some(current), "ENTRY_ARRAY index does not fit usize")
+                })?;
+                let offset = read_entry_array_item(self, current, &layout, index)?;
+                let last = self.read_entry_meta(offset)?;
+                return Ok(EntryRange {
+                    first: first.unwrap_or(last),
+                    last,
+                });
+            }
+            remaining -= count;
+            let next = layout.next_entry_array_offset;
+            if next != 0 && next <= current {
+                return Err(self.metadata_error(
+                    Some(current),
+                    format!("ENTRY_ARRAY next offset does not move forward ({next} <= {current})"),
+                ));
+            }
+            current = next;
+        }
+        Err(self.metadata_error(
+            Some(current),
+            "ENTRY_ARRAY chain contains fewer offsets than entry metadata requires",
+        ))
+    }
+
     pub(crate) fn read_entry_array_items(&self, offset: u64) -> Result<Vec<u64>> {
         Ok(read_entry_array_object(self, offset)?.items)
     }
@@ -1004,7 +1122,70 @@ fn read_entry_array_object(file: &JournalFile, offset: u64) -> Result<EntryArray
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{JournalConfig, MmapPolicy};
     use std::cell::Cell;
+
+    fn range_fixture(n_entries: u64, tail_hint_seqnum: u64) -> (tempfile::TempDir, JournalFile) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("range.journal");
+        let mut bytes = vec![0u8; 472];
+        bytes[..8].copy_from_slice(b"LPKSHHRH");
+        bytes[16] = STATE_ONLINE;
+        let put = |bytes: &mut [u8], offset: usize, value: u64| {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        put(&mut bytes, 88, 272);
+        put(&mut bytes, 96, 200);
+        put(&mut bytes, 136, 392);
+        put(&mut bytes, 152, n_entries);
+        put(&mut bytes, 160, tail_hint_seqnum);
+        put(&mut bytes, 176, 272);
+        put(&mut bytes, 264, 312 + (tail_hint_seqnum - 1) * 80);
+        bytes[272] = OBJECT_ENTRY_ARRAY;
+        put(&mut bytes, 280, 40);
+        put(&mut bytes, 296, 312);
+        put(&mut bytes, 304, 392);
+        for (offset, seqnum) in [(312, 1), (392, 2)] {
+            bytes[offset] = crate::format::OBJECT_ENTRY;
+            put(&mut bytes, offset + 8, 80);
+            put(&mut bytes, offset + 16, seqnum);
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let file = JournalFile::open(
+            path,
+            &JournalConfig {
+                mmap_policy: MmapPolicy::Never,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        (root, file)
+    }
+
+    #[test]
+    fn entry_range_ignores_slots_beyond_snapshotted_n_entries() {
+        let (_root, file) = range_fixture(1, 2);
+        let range = file.entry_range().unwrap().unwrap();
+        assert_eq!(range.first.seqnum, 1);
+        assert_eq!(range.last.seqnum, 1);
+    }
+
+    #[test]
+    fn entry_range_does_not_trust_tail_hints_from_the_previous_append() {
+        let (_root, file) = range_fixture(2, 1);
+        let range = file.entry_range().unwrap().unwrap();
+        assert_eq!(range.first.seqnum, 1);
+        assert_eq!(range.last.seqnum, 2);
+    }
+
+    #[test]
+    fn entry_range_rejects_a_chain_shorter_than_n_entries() {
+        let (_root, file) = range_fixture(3, 2);
+        assert!(matches!(
+            file.entry_range(),
+            Err(SdJournalError::Transient { .. })
+        ));
+    }
 
     #[test]
     fn after_offset_partition_is_logarithmic_for_a_large_array() {

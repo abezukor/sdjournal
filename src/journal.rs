@@ -4,7 +4,7 @@ use crate::error::{LimitKind, Result, SdJournalError};
 use crate::file::{EntryRange, JournalFile};
 use crate::live::LiveJournal;
 use crate::query::JournalQuery;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,7 +33,8 @@ pub(crate) struct JournalFileInfo {
     pub(crate) seqnum_id: [u8; 16],
     pub(crate) entry_range: Option<EntryRange>,
     pub(crate) entry_range_known: bool,
-    file: Option<JournalFile>,
+    file: JournalFile,
+    keep_open: bool,
 }
 
 pub(crate) struct JournalDiscovery {
@@ -118,7 +119,7 @@ impl Journal {
         #[cfg(feature = "tracing")]
         debug!(
             n_files = file_set.file_infos.len(),
-            lazy = file_set.file_infos.iter().any(|info| info.file.is_none()),
+            lazy = file_set.file_infos.iter().any(|info| !info.keep_open),
             "journal opened"
         );
 
@@ -178,7 +179,7 @@ pub(crate) struct JournalFileSet {
 
 impl JournalInner {
     pub(crate) fn is_lazy(&self) -> bool {
-        self.file_infos.iter().any(|info| info.file.is_none())
+        self.file_infos.iter().any(|info| !info.keep_open)
     }
 
     pub(crate) fn file_count(&self) -> usize {
@@ -200,25 +201,20 @@ impl JournalInner {
         if self.is_lazy() {
             return None;
         }
-        self.file_infos
-            .iter()
-            .map(|info| info.file.clone())
-            .collect()
+        Some(
+            self.file_infos
+                .iter()
+                .map(|info| info.file.clone())
+                .collect(),
+        )
     }
 
     pub(crate) fn open_file_by_index(&self, idx: usize) -> Result<JournalFile> {
         let info = self.file_infos.get(idx).ok_or(SdJournalError::NotFound)?;
-        if let Some(file) = &info.file {
-            return Ok(file.clone());
-        }
-        let file = JournalFile::open_reopen(info.path.clone(), &self.config)?;
-        if file.file_id() != info.file_id || file.seqnum_id() != info.seqnum_id {
-            return Err(SdJournalError::Transient {
-                path: Some(info.path.clone()),
-                reason: "journal file was replaced after discovery".to_string(),
-            });
-        }
-        Ok(file)
+        // Validate the current path, but retain the header and committed bounds captured at
+        // discovery. A new, partially written tail must not invalidate the existing snapshot.
+        info.file.validate_reopen_identity()?;
+        Ok(info.file.clone())
     }
 }
 
@@ -237,7 +233,12 @@ impl JournalFileInfo {
             seqnum_id,
             entry_range,
             entry_range_known,
-            file: keep_open.then_some(file),
+            file: if keep_open {
+                file
+            } else {
+                file.reopen_snapshot()
+            },
+            keep_open,
         }
     }
 }
@@ -321,7 +322,7 @@ fn open_lazy_file_set(paths: Vec<PathBuf>, config: &JournalConfig) -> Result<Jou
     let mut seen: HashSet<[u8; 16]> = HashSet::new();
 
     for path in paths {
-        match JournalFile::open(path.clone(), config) {
+        match JournalFile::open_reopen(path.clone(), config) {
             Ok(file) => {
                 let info = JournalFileInfo::from_open_file(file, false);
                 if seen.insert(info.file_id) {
@@ -357,18 +358,20 @@ pub(crate) fn discover_journal_candidates(
     }
 
     let mut roots = paths.to_vec();
-    roots.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+    roots.sort();
     roots.dedup();
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut candidates = BTreeSet::new();
     let mut first_discover_error: Option<SdJournalError> = None;
-    for p in paths {
-        if let Err(e) = discover_journal_paths(p, config, &mut candidates)
-            && first_discover_error.is_none()
-        {
-            #[cfg(feature = "tracing")]
-            warn!(path = %p.display(), error = %e, "journal discovery failed");
-            first_discover_error = Some(e);
+    for p in &roots {
+        match discover_journal_paths(p, config, &mut candidates) {
+            Err(e @ SdJournalError::LimitExceeded { .. }) => return Err(e),
+            Err(e) if first_discover_error.is_none() => {
+                #[cfg(feature = "tracing")]
+                warn!(path = %p.display(), error = %e, "journal discovery failed");
+                first_discover_error = Some(e);
+            }
+            _ => {}
         }
     }
 
@@ -376,23 +379,16 @@ pub(crate) fn discover_journal_candidates(
         return Err(first_discover_error.unwrap_or(SdJournalError::NotFound));
     }
 
-    candidates.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-    candidates.dedup();
-
-    if candidates.len() > config.max_journal_files {
-        return Err(SdJournalError::LimitExceeded {
-            kind: LimitKind::JournalFiles,
-            limit: u64::try_from(config.max_journal_files).unwrap_or(u64::MAX),
-        });
-    }
-
-    Ok(JournalDiscovery { roots, candidates })
+    Ok(JournalDiscovery {
+        roots,
+        candidates: candidates.into_iter().collect(),
+    })
 }
 
 fn discover_journal_paths(
     dir: &Path,
     config: &JournalConfig,
-    out: &mut Vec<PathBuf>,
+    out: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     let rd = std::fs::read_dir(dir)
         .map_err(|e| SdJournalError::io("read_dir", Some(dir.to_path_buf()), e))?;
@@ -423,7 +419,7 @@ fn discover_journal_paths(
         }
 
         if is_journal_file(&entry.path(), config) {
-            out.push(entry.path());
+            insert_journal_candidate(out, entry.path(), config)?;
         }
     }
 
@@ -442,11 +438,26 @@ fn discover_journal_paths(
                 continue;
             }
             if is_journal_file(&entry.path(), config) {
-                out.push(entry.path());
+                insert_journal_candidate(out, entry.path(), config)?;
             }
         }
     }
 
+    Ok(())
+}
+
+fn insert_journal_candidate(
+    out: &mut BTreeSet<PathBuf>,
+    path: PathBuf,
+    config: &JournalConfig,
+) -> Result<()> {
+    out.insert(path);
+    if out.len() > config.max_journal_files {
+        return Err(SdJournalError::LimitExceeded {
+            kind: LimitKind::JournalFiles,
+            limit: u64::try_from(config.max_journal_files).unwrap_or(u64::MAX),
+        });
+    }
     Ok(())
 }
 
@@ -525,11 +536,13 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&root_journal, root.join("link.journal")).unwrap();
 
-        let mut out = Vec::new();
+        let mut out = BTreeSet::new();
         discover_journal_paths(root, &JournalConfig::default(), &mut out).unwrap();
-        out.sort();
 
-        assert_eq!(out, vec![nested_journal.clone(), root_journal.clone()]);
+        assert_eq!(
+            out,
+            BTreeSet::from([nested_journal.clone(), root_journal.clone()])
+        );
 
         out.clear();
         discover_journal_paths(
@@ -541,8 +554,59 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        out.sort();
+        assert_eq!(
+            out,
+            BTreeSet::from([nested_journal, root_journal, tilde_journal])
+        );
+    }
 
-        assert_eq!(out, vec![nested_journal, root_journal, tilde_journal]);
+    #[cfg(unix)]
+    #[test]
+    fn discovery_deduplicates_non_utf8_paths_before_enforcing_file_limit() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempdir().unwrap();
+        let machine_dir = dir.path().join("0123456789abcdef0123456789abcdef");
+        fs::create_dir(&machine_dir).unwrap();
+        for byte in [0x80, 0x81] {
+            let name = OsString::from_vec([&[byte], b".journal".as_slice()].concat());
+            File::create(machine_dir.join(name)).unwrap();
+        }
+        let config = JournalConfig {
+            max_journal_files: 2,
+            ..Default::default()
+        };
+        let discovery =
+            discover_journal_candidates(&[dir.path().to_path_buf(), machine_dir], &config).unwrap();
+        assert_eq!(discovery.candidates.len(), 2);
+    }
+
+    #[test]
+    fn discovery_stops_at_the_configured_limit_even_after_finding_valid_candidates() {
+        let dir = tempdir().unwrap();
+        for idx in 0..10 {
+            File::create(dir.path().join(format!("{idx}.journal"))).unwrap();
+        }
+        let config = JournalConfig {
+            max_journal_files: 2,
+            ..Default::default()
+        };
+        let mut candidates = BTreeSet::new();
+        assert!(matches!(
+            discover_journal_paths(dir.path(), &config, &mut candidates),
+            Err(SdJournalError::LimitExceeded {
+                kind: LimitKind::JournalFiles,
+                limit: 2
+            })
+        ));
+        assert_eq!(candidates.len(), 3);
+        assert!(matches!(
+            discover_journal_candidates(&[dir.path().to_path_buf()], &config),
+            Err(SdJournalError::LimitExceeded {
+                kind: LimitKind::JournalFiles,
+                limit: 2
+            })
+        ));
     }
 }

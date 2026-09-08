@@ -34,7 +34,6 @@ pub(crate) const OBJECT_DATA: u8 = 1;
 #[cfg(feature = "verify-seal")]
 pub(crate) const OBJECT_FIELD: u8 = 2;
 pub(crate) const OBJECT_ENTRY: u8 = 3;
-#[cfg(feature = "verify-seal")]
 pub(crate) const OBJECT_DATA_HASH_TABLE: u8 = 4;
 #[cfg(feature = "verify-seal")]
 pub(crate) const OBJECT_FIELD_HASH_TABLE: u8 = 5;

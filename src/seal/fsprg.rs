@@ -343,7 +343,47 @@ mod tests {
     use super::{
         FSPRG_RECOMMENDED_SEEDLEN, FsprgParams, FsprgState, genprime3mod4, gensquare, modinv,
     };
-    use crate::seal::{RND_GEN_P, RND_GEN_Q, RND_GEN_X};
+    use crate::seal::{HmacSha256, RND_GEN_P, RND_GEN_Q, RND_GEN_X};
+    use crate::util::hex_encode;
+    use hmac::{KeyInit as _, Mac as _};
+
+    #[test]
+    fn fsprg_random_seek_and_hmac_match_systemd_vectors() {
+        // Fixed seed and epoch 0..3 vectors from systemd's libgcrypt/OpenSSL interop test:
+        // https://github.com/systemd/systemd/blob/a7fc55f8654bef6a01c72ae7a6efa3357d1f344b/src/test/test-fsprg.c
+        let expected_keys = [
+            "cae42eba74554f104f72a43a0b00a0c8d88fa7118d562a72e4a8d269f9d8a0f1",
+            "631d5211ed13a88e4ce0062ee6a3a1f67af1c41e18bf74e2522386561b0e787d",
+            "3fb2b639e3544104f3485f50f78bd6e78e45c2eebfddfd83347a9a8af34dd4c6",
+            "987629e227f00e2affc8fd3bcfcb9f6de980fe6ed9c04329c5535ff786333b70",
+        ];
+        let expected_tags = [
+            "10a41419ecf19b6de5e3122b06ee5baca7110b7015fd47a4b9d745194bde925d",
+            "75545b6afb30433b299458ee62d9622b6188edcec9951e829ed6d19023c69065",
+            "2f8b64a421e87493a23a6aa90d7eb080ce7480b906aeec864c3299f9481f0cad",
+            "399ef6c31eca02b26ae2a6470bb5b6af46d79913c607a88073357573fd035b3e",
+        ];
+        let seed = std::array::from_fn(|i| u8::try_from(i).unwrap());
+        let params = FsprgParams::new(&seed).unwrap();
+        let mut state = FsprgState::new(&params);
+
+        // Include forward jumps, backward jumps, repeated seeks, and a single-step evolve.
+        // Sequential seeks alone take the evolve fast path and never exercise CRT seeking.
+        for epoch in [0usize, 3, 1, 2, 2, 0] {
+            state.seek(epoch as u64).unwrap();
+            assert_eq!(state.epoch, epoch as u64);
+            let key = state.get_key(32, 0);
+            assert_eq!(hex_encode(&key), expected_keys[epoch], "epoch {epoch}");
+
+            let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+            mac.update(format!("dummy data: {epoch}, hoge hoge hoge hoge hoge").as_bytes());
+            assert_eq!(
+                hex_encode(&mac.finalize().into_bytes()),
+                expected_tags[epoch],
+                "epoch {epoch}"
+            );
+        }
+    }
 
     #[test]
     fn fsprg_seek_matches_evolve_small_secpar() {

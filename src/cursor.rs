@@ -2,6 +2,7 @@ use crate::error::{Result, SdJournalError};
 use crate::util::{hex_decode, hex_encode};
 use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 const PREFIX_V1: &str = "SJ1:";
 
@@ -122,12 +123,43 @@ pub(crate) fn same_entry(left: &SdJournalEntryKey, right: &SdJournalEntryKey) ->
 /// A cursor can be round-tripped through [`std::string::ToString::to_string`] and
 /// [`Cursor::parse`]. The textual representation is stable for `sdjournal`-generated cursors and
 /// also accepts native systemd cursor strings for resume interoperability.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Equality and hashing use the persisted cursor identity. Physical file hints do not distinguish
+/// complete cursors for the same logical entry.
+#[derive(Debug, Clone)]
 pub struct Cursor {
     kind: CursorKind,
 }
 
+impl PartialEq for Cursor {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_kind() == other.canonical_kind()
+    }
+}
+
+impl Eq for Cursor {}
+
+impl Hash for Cursor {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.canonical_kind().hash(state);
+    }
+}
+
 impl Cursor {
+    fn canonical_kind(&self) -> CursorKind {
+        match &self.kind {
+            CursorKind::LocationKey(key) => CursorKind::Systemd(SystemdCursor {
+                seqnum_id: Some(key.seqnum_id),
+                seqnum: Some(key.seqnum),
+                boot_id: Some(key.boot_id),
+                monotonic_usec: Some(key.monotonic_usec),
+                realtime_usec: Some(key.realtime_usec),
+                xor_hash: Some(key.xor_hash),
+            }),
+            kind => kind.clone(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn new_entry_key(
         file_id: [u8; 16],
@@ -651,6 +683,39 @@ mod tests {
         assert_eq!(systemd.xor_hash, Some(key.xor_hash));
         assert_eq!(parsed.file_offset(), None);
         assert_eq!(parsed.to_string(), encoded);
+    }
+
+    #[test]
+    fn cursor_roundtrip_preserves_equality_and_hash_identity() {
+        use std::collections::HashSet;
+
+        let key = SdJournalEntryKey {
+            file_id: [1; 16],
+            entry_offset: 512,
+            seqnum_id: [2; 16],
+            seqnum: 3,
+            boot_id: [4; 16],
+            monotonic_usec: 5,
+            realtime_usec: 6,
+            xor_hash: 7,
+        };
+        let cursor = Cursor::new_location_key(key);
+        let parsed = Cursor::parse(&cursor.to_string()).unwrap();
+        assert_eq!(cursor, parsed);
+        let cursors = HashSet::from([cursor.clone()]);
+        assert!(cursors.contains(&parsed));
+
+        let copy = Cursor::new_location_key(SdJournalEntryKey {
+            file_id: [8; 16],
+            entry_offset: 1024,
+            ..key
+        });
+        assert_eq!(copy, cursor);
+        assert!(cursors.contains(&copy));
+        let different = Cursor::new_location_key(SdJournalEntryKey { seqnum: 9, ..key });
+        assert_ne!(cursor, different);
+        assert!(!cursors.contains(&different));
+        assert_ne!(cursor, Cursor::parse("t=6").unwrap());
     }
 
     #[test]

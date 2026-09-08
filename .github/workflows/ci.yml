@@ -88,8 +88,11 @@ jobs:
       - name: cargo clippy (no default features)
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
-      - name: cargo test (no default features, lib)
-        run: cargo test --lib --no-default-features
+      - name: cargo test (no default features, unit and synthetic integration)
+        run: >-
+          cargo test --no-default-features --lib
+          --test offline_journal --test journal_snapshot
+          --test parser_regressions --test live_shared_engine
 
       - name: cargo check (no default features + tokio)
         run: cargo check --no-default-features --features tokio
@@ -126,7 +129,9 @@ jobs:
         run: cargo check --all-features
 
       - name: cargo test (offline)
-        run: cargo test --lib --test offline_journal --all-features
+        run: >-
+          cargo test --all-features --lib --test offline_journal
+          --test journal_snapshot --test parser_regressions
 
   golden:
     name: golden (${{ matrix.os }})

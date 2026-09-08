@@ -76,6 +76,7 @@ fn open_dirs_deduplicates_user_supplied_roots() {
 #[test]
 fn exact_query_returns_all_entries_with_duplicate_data_payloads() {
     let layout = SyntheticJournalFile::new(&["alpha.service", "alpha.service", "alpha.service"]);
+    mark_journal_offline(&layout.root().join("synthetic.journal"));
     let journal = Journal::open_dir(layout.root()).expect("open synthetic journal directory");
 
     let mut query = journal.query();
@@ -110,6 +111,22 @@ fn collect_owned_limited_applies_a_hard_result_cap() {
         .collect_owned_limited(2)
         .expect("keep the lower existing query limit");
     assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn query_limit_does_not_surface_errors_after_the_requested_result_count() {
+    let layout = SyntheticJournalFile::new(&["alpha.service", "beta.service"]);
+    let path = layout.root().join("synthetic.journal");
+    let mut bytes = fs::read(&path).unwrap();
+    let tail = u64::from_le_bytes(bytes[264..272].try_into().unwrap()) as usize;
+    bytes[tail] = 0; // The second ENTRY is corrupt; the requested first ENTRY is intact.
+    fs::write(&path, bytes).unwrap();
+    let journal = Journal::open_dir(layout.root()).unwrap();
+
+    let entries = journal.query().collect_owned_limited(1).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(field(&entries[0], "_SYSTEMD_UNIT"), "alpha.service");
+    assert!(journal.query().collect_owned().is_err());
 }
 
 #[test]
@@ -341,6 +358,7 @@ fn indexed_candidates_are_verified_against_entry_payloads() {
     let layout = SyntheticJournalFile::new(&["alpha.service", "beta.service"]);
     let path = layout.root().join("synthetic.journal");
     redirect_data_index_entry(&path, b"_SYSTEMD_UNIT=alpha.service", 1);
+    mark_journal_offline(&path);
 
     let journal = Journal::open_dir(layout.root()).expect("open journal with damaged index");
     let mut query = journal.query();
@@ -381,6 +399,8 @@ fn lazy_index_continuation_does_not_rescan_or_skip_prior_offsets() {
     let units = vec!["alpha.service"; 40];
     let layout = SyntheticJournalFile::new(&units);
     write_synthetic_journal_file(&layout.root().join("later.journal"), &units, 9);
+    mark_journal_offline(&layout.root().join("synthetic.journal"));
+    mark_journal_offline(&layout.root().join("later.journal"));
     let cfg = sdjournal::JournalConfig {
         max_open_files: 1,
         mmap_policy: MmapPolicy::Never,
@@ -503,6 +523,7 @@ fn data_hash_chain_self_loop_falls_back_without_hanging_or_losing_matches() {
     let layout = SyntheticJournalFile::new(&["alpha.service", "beta.service"]);
     let path = layout.root().join("synthetic.journal");
     make_first_data_hash_link_self_referential(&path);
+    mark_journal_offline(&path);
 
     let journal =
         Journal::open_dir(layout.root()).expect("open journal with cyclic DATA hash link");
@@ -515,6 +536,29 @@ fn data_hash_chain_self_loop_falls_back_without_hanging_or_losing_matches() {
         messages(&entries),
         vec![synthetic_message(7, 0, "alpha.service")]
     );
+}
+
+#[test]
+fn online_exact_queries_include_committed_entries_before_data_postings_are_updated() {
+    let layout = SyntheticJournalFile::new(&["alpha.service"]);
+    let path = layout.root().join("synthetic.journal");
+    // systemd commits the file-level entry count before linking the ENTRY into each DATA index.
+    // This append reuses the first ENTRY's DATA objects and leaves their old postings intact.
+    append_duplicate_entry_in_place(&path);
+
+    let journal =
+        Journal::open_dir(layout.root()).expect("open ONLINE journal during DATA linking");
+    for reverse in [false, true] {
+        let mut query = journal.query();
+        query
+            .match_exact("_SYSTEMD_UNIT", b"alpha.service")
+            .reverse(reverse);
+        let entries = query
+            .collect_owned()
+            .expect("query committed ONLINE entries");
+        let seqnums: Vec<_> = entries.iter().map(sdjournal::EntryOwned::seqnum).collect();
+        assert_eq!(seqnums, if reverse { vec![2, 1] } else { vec![1, 2] });
+    }
 }
 
 #[test]
@@ -544,6 +588,120 @@ fn exact_cursor_excludes_cross_file_copy_of_the_same_logical_entry() {
                 .is_empty(),
             "exclusive cursor leaked a cross-file logical duplicate (reverse={reverse})"
         );
+    }
+}
+
+#[test]
+fn in_memory_cursor_resumes_from_a_copy_after_the_original_file_is_removed() {
+    let layout = SyntheticJournalFile::new(&["alpha.service", "beta.service"]);
+    let original = layout.root().join("synthetic.journal");
+    let original_journal = Journal::open_dir(layout.root()).expect("open original journal");
+    let cursor = original_journal
+        .query()
+        .collect_owned()
+        .expect("read original entries")[0]
+        .cursor()
+        .expect("entry cursor");
+    drop(original_journal);
+
+    let duplicate = layout.root().join("duplicate.journal");
+    fs::copy(&original, &duplicate).expect("copy entries to another journal");
+    patch_file_id(&duplicate, [0xa5; 16]);
+    fs::remove_file(&original).expect("remove original journal");
+
+    let journal = Journal::open_dir(layout.root()).expect("open remaining copy");
+    let persisted = Cursor::parse(&cursor.to_string()).expect("round-trip cursor");
+    for cursor in [persisted, cursor] {
+        for reverse in [false, true] {
+            let mut query = journal.query();
+            query.after_cursor(cursor.clone()).reverse(reverse);
+            let entries = query.collect_owned().expect("resume from remaining copy");
+            assert_eq!(
+                messages(&entries),
+                vec![synthetic_message(7, 1, "beta.service")]
+            );
+        }
+    }
+}
+
+#[test]
+fn cursor_seek_cannot_inject_an_entry_beyond_the_snapshot_entry_count() {
+    let layout = SyntheticJournalFile::new(&["committed.service", "uncommitted.service"]);
+    let path = layout.root().join("synthetic.journal");
+    let full_journal = Journal::open_dir(layout.root()).expect("open complete fixture");
+    let cursor = full_journal
+        .query()
+        .collect_owned()
+        .expect("read full fixture")[1]
+        .cursor()
+        .expect("second ENTRY cursor");
+    drop(full_journal);
+
+    let mut bytes = fs::read(&path).expect("read fixture before withholding the commit");
+    let array = usize::try_from(read_u64(&bytes, 176)).expect("array offset fits");
+    let first = read_u64(&bytes, array + 24);
+    let second = read_u64(&bytes, array + 32);
+    let mut raw_location = vec![1]; // SJ1 FileOffset, without the full logical identity.
+    raw_location.extend_from_slice(&bytes[24..40]);
+    raw_location.extend_from_slice(&second.to_le_bytes());
+    let raw_location = raw_location
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let file_offset_cursor =
+        Cursor::parse(&format!("SJ1:{raw_location}")).expect("parse physical-location cursor");
+    write_u64(&mut bytes, 152, 1);
+    write_u64(&mut bytes, 160, 1);
+    write_u64(&mut bytes, 192, synthetic_realtime_usec(7, 0));
+    write_u64(&mut bytes, 264, first);
+    fs::write(&path, bytes).expect("leave second ENTRY outside the committed entry count");
+
+    let journal = Journal::open_dir(layout.root()).expect("open one-entry snapshot");
+    let persisted = Cursor::parse(&cursor.to_string()).expect("round-trip full cursor");
+    for cursor in [persisted, cursor, file_offset_cursor] {
+        assert!(matches!(
+            journal
+                .seek_cursor(&cursor)
+                .expect("build inclusive seek")
+                .collect_owned(),
+            Err(SdJournalError::NotFound)
+        ));
+    }
+}
+
+#[test]
+fn a_filtered_out_entry_does_not_hide_a_prefetched_read_error() {
+    let layout = SyntheticJournalFile::new(&["alpha.service", "broken.service", "beta.service"]);
+    let path = layout.root().join("synthetic.journal");
+    let mut bytes = fs::read(&path).expect("read synthetic journal");
+    let array = usize::try_from(read_u64(&bytes, 176)).expect("entry array offset fits");
+    let entry = usize::try_from(read_u64(&bytes, array + 32)).expect("second ENTRY offset fits");
+    bytes[entry] = 1; // DATA, not ENTRY; the endpoints remain valid for discovery.
+    bytes[16] = 0; // Exercise individual OR branch iterators as well as the global merger.
+    fs::write(&path, bytes).expect("damage middle ENTRY type");
+
+    let journal = Journal::open_dir(layout.root()).expect("open journal with damaged middle ENTRY");
+    for reverse in [false, true] {
+        for or_groups in [false, true] {
+            let mut query = journal.query();
+            query.match_present("ABSENT_FIELD").reverse(reverse);
+            if or_groups {
+                query
+                    .or_group(|group| {
+                        group.match_present("MESSAGE");
+                    })
+                    .or_group(|group| {
+                        group.match_present("PRIORITY");
+                    });
+            }
+            assert!(
+                matches!(
+                    query.collect_owned(),
+                    Err(SdJournalError::Corrupt { .. } | SdJournalError::Transient { .. })
+                ),
+                "a query must surface the read error even with no matches (reverse={reverse}, or_groups={or_groups})"
+            );
+        }
     }
 }
 
@@ -692,6 +850,12 @@ fn messages(entries: &[sdjournal::EntryOwned]) -> Vec<String> {
         .iter()
         .map(|entry| field(entry, "MESSAGE"))
         .collect()
+}
+
+fn mark_journal_offline(path: &Path) {
+    let mut bytes = fs::read(path).expect("read synthetic journal state");
+    bytes[16] = 0;
+    fs::write(path, bytes).expect("mark synthetic journal OFFLINE");
 }
 
 fn patch_entry_timestamps(path: &std::path::Path, timestamps: &[u64]) {

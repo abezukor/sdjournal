@@ -133,11 +133,10 @@ impl Iterator for FileOrIter {
             return None;
         }
 
-        if let Some(err) = self.pending_error.take() {
-            return Some(Err(err));
-        }
-
         loop {
+            if let Some(err) = self.pending_error.take() {
+                return Some(Err(err));
+            }
             let item = match self.pop_next() {
                 Some(item) => item,
                 None => {
@@ -419,11 +418,10 @@ impl Iterator for OffsetOrIter {
             return None;
         }
 
-        if let Some(err) = self.pending_error.take() {
-            return Some(Err(err));
-        }
-
         loop {
+            if let Some(err) = self.pending_error.take() {
+                return Some(Err(err));
+            }
             let item = match self.pop_next() {
                 Some(item) => item,
                 None => {
@@ -493,7 +491,9 @@ impl FileBranchIter {
             })
             .collect();
 
-        if exact_payloads.is_empty() {
+        // While ONLINE, systemd commits the file-level ENTRY array/count before updating DATA
+        // postings. Even an internally valid index may therefore omit committed matches.
+        if exact_payloads.is_empty() || file.is_online() {
             let iter = scan_iter(file.clone(), reverse, after_entry_offset)?;
             return Ok(Self {
                 file,
@@ -762,8 +762,11 @@ impl EagerJournalIter {
                     continue;
                 }
             };
-            let mut branch_iters = Vec::with_capacity(branches.len());
-            for terms in &branches {
+            // Every ONLINE branch scans the same ENTRY array. One scan is enough because the
+            // complete boolean expression is evaluated after the cross-file merge.
+            let branch_count = if file.is_online() { 1 } else { branches.len() };
+            let mut branch_iters = Vec::with_capacity(branch_count);
+            for terms in branches.iter().take(branch_count) {
                 match FileBranchIter::new(
                     file.clone(),
                     terms.clone(),
@@ -897,10 +900,6 @@ impl Iterator for EagerJournalIter {
             return None;
         }
 
-        if let Some(err) = self.pending_error.take() {
-            return Some(Err(err));
-        }
-
         if let Some(limit) = self.query.limit
             && (limit == 0 || self.produced >= limit)
         {
@@ -908,7 +907,16 @@ impl Iterator for EagerJournalIter {
             return None;
         }
 
+        if let Some(err) = self.pending_error.take() {
+            return Some(Err(err));
+        }
+
         loop {
+            // Advancing a source can fail even when the current candidate is filtered out or
+            // deduplicated. Surface that error before another loop iteration can exhaust us.
+            if let Some(err) = self.pending_error.take() {
+                return Some(Err(err));
+            }
             let item = match self.pop_next() {
                 Some(item) => item,
                 None => {

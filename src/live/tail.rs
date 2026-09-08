@@ -88,7 +88,10 @@ impl FileTailCursor {
                 .unwrap_or(usize::MAX)
                 .min(items.len());
             next_item_idx = used;
-            last_entry_offset = items.get(..used).and_then(|items| items.last()).copied();
+            for &entry_offset in &items[..used] {
+                validate_tail_entry_offset(file, entry_offset, last_entry_offset)?;
+                last_entry_offset = Some(entry_offset);
+            }
             remaining = remaining.saturating_sub(u64::try_from(used).unwrap_or(u64::MAX));
             if remaining == 0 {
                 break;
@@ -150,12 +153,11 @@ impl FileTailCursor {
                 while item_idx < items.len() && remaining != 0 {
                     let entry_offset = items[item_idx];
                     item_idx = item_idx.saturating_add(1);
-                    if entry_offset != 0 {
-                        out.push(entry_offset);
-                        self.last_entry_offset = Some(entry_offset);
-                        self.consumed_entries = self.consumed_entries.saturating_add(1);
-                        remaining = remaining.saturating_sub(1);
-                    }
+                    validate_tail_entry_offset(file, entry_offset, self.last_entry_offset)?;
+                    out.push(entry_offset);
+                    self.last_entry_offset = Some(entry_offset);
+                    self.consumed_entries = self.consumed_entries.saturating_add(1);
+                    remaining = remaining.saturating_sub(1);
                     if out.len() >= limit {
                         self.next_item_idx = item_idx;
                         return Ok(OffsetBatch {
@@ -180,12 +182,11 @@ impl FileTailCursor {
             while item_idx < items.len() && remaining != 0 {
                 let entry_offset = items[item_idx];
                 item_idx = item_idx.saturating_add(1);
-                if entry_offset != 0 {
-                    out.push(entry_offset);
-                    self.last_entry_offset = Some(entry_offset);
-                    self.consumed_entries = self.consumed_entries.saturating_add(1);
-                    remaining = remaining.saturating_sub(1);
-                }
+                validate_tail_entry_offset(file, entry_offset, self.last_entry_offset)?;
+                out.push(entry_offset);
+                self.last_entry_offset = Some(entry_offset);
+                self.consumed_entries = self.consumed_entries.saturating_add(1);
+                remaining = remaining.saturating_sub(1);
                 if out.len() >= limit {
                     self.current_array_offset = Some(current);
                     self.next_item_idx = item_idx;
@@ -235,6 +236,22 @@ impl FileTailCursor {
             exhausted: true,
         })
     }
+}
+
+fn validate_tail_entry_offset(
+    file: &JournalFile,
+    offset: u64,
+    previous: Option<u64>,
+) -> Result<()> {
+    if offset == 0 || previous.is_some_and(|previous| offset <= previous) {
+        return Err(SdJournalError::Transient {
+            path: Some(file.path().to_path_buf()),
+            reason: format!(
+                "committed ENTRY_ARRAY offsets must be nonzero and strictly increasing ({previous:?} -> {offset})"
+            ),
+        });
+    }
+    Ok(())
 }
 
 struct TrackedFileBuilder {

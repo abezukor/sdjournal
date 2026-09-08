@@ -3,7 +3,8 @@ use super::{DataEntryOffsetIter, JournalFile};
 use crate::error::{CompressionAlgo, LimitKind, Result, SdJournalError};
 use crate::format::{
     HEADER_INCOMPATIBLE_COMPRESSED_LZ4, HEADER_INCOMPATIBLE_COMPRESSED_XZ,
-    HEADER_INCOMPATIBLE_COMPRESSED_ZSTD, OBJECT_DATA, ObjectHeader, compression_from_object_flags,
+    HEADER_INCOMPATIBLE_COMPRESSED_ZSTD, OBJECT_DATA, OBJECT_DATA_HASH_TABLE, ObjectHeader,
+    compression_from_object_flags,
 };
 use crate::reader::ByteBuf;
 use crate::util::{checked_add_u64, read_u32_le, read_u64_le};
@@ -57,6 +58,12 @@ impl JournalFile {
             ));
         }
         if table_offset == 0 {
+            if self.inner.header.n_entries != 0 {
+                return Err(self.metadata_error(
+                    Some(104),
+                    "DATA_HASH_TABLE is absent despite committed entries",
+                ));
+            }
             return Ok(Vec::new());
         }
         if !table_size.is_multiple_of(16) {
@@ -70,6 +77,35 @@ impl JournalFile {
             return Err(self.metadata_error(
                 Some(table_offset),
                 format!("DATA_HASH_TABLE offset is not 8-byte aligned: {table_offset}"),
+            ));
+        }
+
+        // Header offsets address the HashItem payload, not the enclosing object. Validate
+        // that complete object before interpreting an arbitrary zero-filled region as a
+        // valid empty bucket, which would otherwise silently hide matching entries.
+        let object_offset = table_offset.checked_sub(16).ok_or_else(|| {
+            self.metadata_error(
+                Some(table_offset),
+                "DATA_HASH_TABLE payload offset is too small",
+            )
+        })?;
+        self.validate_object_offset(object_offset)?;
+        let object_bytes = self.read_bytes(object_offset, 16)?;
+        let object_header =
+            ObjectHeader::parse(object_bytes.as_slice(), self.path(), object_offset)?;
+        if object_header.object_type != OBJECT_DATA_HASH_TABLE
+            || object_header.size.checked_sub(16) != Some(table_size)
+        {
+            return Err(self.metadata_error(
+                Some(object_offset),
+                "DATA_HASH_TABLE object does not match the header offset and size",
+            ));
+        }
+        let table_end = checked_add_u64(table_offset, table_size, "DATA_HASH_TABLE range")?;
+        if table_end > self.inner.used_size {
+            return Err(self.metadata_error(
+                Some(object_offset),
+                "DATA_HASH_TABLE extends beyond committed journal data",
             ));
         }
 

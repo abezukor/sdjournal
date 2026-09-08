@@ -3,11 +3,10 @@ use crate::cursor::{Cursor, SdJournalEntryKey};
 use crate::entry::EntryRef;
 use crate::error::Result;
 use crate::journal::Journal;
+use std::collections::VecDeque;
 
 use super::filter::{CompiledFilter, MatchTerm};
-use super::{
-    cursor_from_key, is_skippable_live_file_error, key_from_entry_ref, warn_live_file_error,
-};
+use super::{is_skippable_live_file_error, warn_live_file_error};
 
 pub(super) struct JournalSnapshot {
     pub(super) journal: Option<Journal>,
@@ -16,10 +15,12 @@ pub(super) struct JournalSnapshot {
 
 pub(super) struct ReplayState {
     pub(super) journal: Option<Journal>,
-    pub(super) cursor: Option<Cursor>,
-    pub(super) since_realtime: Option<u64>,
-    pub(super) last_key: Option<SdJournalEntryKey>,
     pub(super) remaining: Option<usize>,
+    cursor: Option<Cursor>,
+    since_realtime: Option<u64>,
+    iter: Option<Box<dyn Iterator<Item = Result<EntryRef>> + Send + Sync>>,
+    buffered: VecDeque<EntryRef>,
+    exhausted: bool,
 }
 
 impl ReplayState {
@@ -29,86 +30,105 @@ impl ReplayState {
         since_realtime: Option<u64>,
         config: &JournalConfig,
     ) -> Self {
-        let (cursor, last_key) = match after_cursor {
-            Some(cursor) => match cursor.sdjournal_entry_key() {
-                Some(key) => (None, Some(key)),
-                None => (Some(cursor), None),
-            },
-            None => (None, None),
-        };
-
         Self {
             journal: snapshot.journal,
-            cursor,
+            cursor: after_cursor,
             since_realtime,
-            last_key,
             remaining: config.max_live_replay_entries,
+            iter: None,
+            buffered: VecDeque::new(),
+            exhausted: false,
         }
     }
 }
 
 pub(super) struct EntryBatch {
     pub(super) entries: Vec<EntryRef>,
-    pub(super) last_key: Option<SdJournalEntryKey>,
     pub(super) exhausted: bool,
 }
 
 pub(super) fn collect_replay_batch(
-    replay: &ReplayState,
+    replay: &mut ReplayState,
     filter: &CompiledFilter,
     limit: usize,
 ) -> Result<EntryBatch> {
     let Some(journal) = replay.journal.as_ref() else {
         return Ok(EntryBatch {
             entries: Vec::new(),
-            last_key: None,
             exhausted: true,
         });
     };
-    let mut q = journal.query();
-    apply_compiled_filter(&mut q, filter);
-    if let Some(since) = replay.since_realtime {
-        q.since_realtime(since);
+    if replay.iter.is_none() {
+        let mut q = journal.query();
+        apply_compiled_filter(&mut q, filter);
+        if let Some(since) = replay.since_realtime {
+            q.since_realtime(since);
+        }
+        if let Some(cursor) = replay.cursor.clone() {
+            q.after_cursor(cursor);
+        }
+        // Resolve the starting cursor only once. A previous batch's source may be vacuumed
+        // before the next poll; replay must still advance through the other snapshot files.
+        replay.iter = Some(Box::new(q.iter()?));
     }
-    if let Some(key) = replay.last_key {
-        q.after_cursor(cursor_from_key(key));
-    } else if let Some(cursor) = replay.cursor.clone() {
-        q.after_cursor(cursor);
-    }
-    q.limit(limit.saturating_add(1));
 
-    collect_entry_batch(q, limit, "skipping live replay entry")
-}
-
-fn collect_entry_batch(
-    query: crate::JournalQuery,
-    limit: usize,
-    skip_message: &'static str,
-) -> Result<EntryBatch> {
-    let mut entries = Vec::with_capacity(limit.min(64));
-    let mut exhausted = true;
-    for item in query.iter()? {
-        match item {
-            Ok(entry) => {
-                if entries.len() >= limit {
-                    exhausted = false;
-                    break;
+    if let Some(iter) = replay.iter.as_mut() {
+        while !replay.exhausted && replay.buffered.len() <= limit {
+            match iter.next() {
+                Some(Ok(entry)) => replay.buffered.push_back(entry),
+                Some(Err(err)) if is_skippable_live_file_error(&err) => {
+                    warn_live_file_error("skipping live replay entry", &err);
                 }
-                entries.push(entry);
+                // Retain already decoded entries if the caller handles this error and polls
+                // again. The buffer is bounded to one batch plus its lookahead entry.
+                Some(Err(err)) => return Err(err),
+                None => replay.exhausted = true,
             }
-            Err(err) if is_skippable_live_file_error(&err) => {
-                warn_live_file_error(skip_message, &err);
-            }
-            Err(err) => return Err(err),
         }
     }
-
-    let last_key = entries.last().map(key_from_entry_ref);
+    let entries = replay
+        .buffered
+        .drain(..limit.min(replay.buffered.len()))
+        .collect();
     Ok(EntryBatch {
         entries,
-        last_key,
-        exhausted,
+        exhausted: replay.exhausted && replay.buffered.is_empty(),
     })
+}
+
+pub(super) fn snapshot_contains_key(replay: &ReplayState, key: SdJournalEntryKey) -> Result<bool> {
+    let Some(journal) = replay.journal.as_ref() else {
+        return Ok(false);
+    };
+    for index in 0..journal.inner.file_count() {
+        let Some(info) = journal.inner.file_info(index) else {
+            continue;
+        };
+        if info.seqnum_id != key.seqnum_id
+            || info.entry_range.is_some_and(|range| {
+                key.seqnum < range.first.seqnum || key.seqnum > range.last.seqnum
+            })
+        {
+            continue;
+        }
+        let file = journal.inner.open_file_by_index(index)?;
+        for item in file.entry_iter_seek_realtime(false, None, None)? {
+            let meta = item?;
+            if meta.seqnum > key.seqnum {
+                break;
+            }
+            if meta.seqnum == key.seqnum
+                && meta.seqnum_id == key.seqnum_id
+                && meta.boot_id == key.boot_id
+                && meta.monotonic_usec == key.monotonic_usec
+                && meta.realtime_usec == key.realtime_usec
+                && meta.xor_hash == key.xor_hash
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn apply_compiled_filter(query: &mut crate::JournalQuery, filter: &CompiledFilter) {

@@ -8,6 +8,7 @@ use tempfile::TempDir;
 
 const HEADER_SIZE: usize = 272;
 const DATA_HASH_TABLE_SIZE: usize = 16;
+const OBJECT_HEADER_SIZE: usize = 16;
 const REGULAR_DATA_OBJECT_HEADER_SIZE: usize = 64;
 const ENTRY_ARRAY_OBJECT_HEADER_SIZE: usize = 24;
 const ENTRY_OBJECT_HEADER_SIZE: usize = 64;
@@ -550,7 +551,7 @@ fn build_journal_bytes<S: AsRef<str>>(units: &[S], seed: u8) -> Vec<u8> {
 
     let mut entries = Vec::with_capacity(units.len());
     let mut data_plans = Vec::new();
-    let mut current = align8(HEADER_SIZE + DATA_HASH_TABLE_SIZE);
+    let mut current = align8(HEADER_SIZE + OBJECT_HEADER_SIZE + DATA_HASH_TABLE_SIZE);
 
     for (entry_idx, unit) in units.iter().enumerate() {
         let unit = unit.as_ref();
@@ -630,7 +631,7 @@ fn build_journal_bytes<S: AsRef<str>>(units: &[S], seed: u8) -> Vec<u8> {
         96,
         u64::try_from(current.saturating_sub(HEADER_SIZE)).expect("arena size fits"),
     );
-    put_u64(&mut bytes, 104, HEADER_SIZE as u64);
+    put_u64(&mut bytes, 104, (HEADER_SIZE + OBJECT_HEADER_SIZE) as u64);
     put_u64(&mut bytes, 112, DATA_HASH_TABLE_SIZE as u64);
     put_u64(&mut bytes, 120, 0);
     put_u64(&mut bytes, 128, 0);
@@ -652,7 +653,14 @@ fn build_journal_bytes<S: AsRef<str>>(units: &[S], seed: u8) -> Vec<u8> {
         u64::try_from(entry_array_offset).expect("entry array offset fits"),
     );
 
-    let table_offset = HEADER_SIZE;
+    put_object_header(
+        &mut bytes,
+        HEADER_SIZE,
+        4,
+        0,
+        (OBJECT_HEADER_SIZE + DATA_HASH_TABLE_SIZE) as u64,
+    );
+    let table_offset = HEADER_SIZE + OBJECT_HEADER_SIZE;
     put_u64(
         &mut bytes,
         table_offset,
