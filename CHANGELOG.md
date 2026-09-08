@@ -1,8 +1,17 @@
+## [0.1.23] - 2026-09-08
+
+### 🐛 Bug Fixes
+
+- Harden journal integrity checks, queries, and live replay
 ## [0.1.22] - 2026-07-28
 
 ### 🐛 Bug Fixes
 
 - Harden journal parsing, querying, and live tailing
+
+### ⚙️ Miscellaneous Tasks
+
+- *(release)* 0.1.22
 ## [0.1.21] - 2026-06-28
 
 ### 🐛 Bug Fixes
